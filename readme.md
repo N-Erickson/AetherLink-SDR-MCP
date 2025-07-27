@@ -1,6 +1,6 @@
 # AetherLink: Software Defined Radio Model Context Protocol Server
 
-Control Software Defined Radios and decode radio protocols through an AI-friendly Model Context Protocol interface. No GNU Radio required!
+Control Software Defined Radios and decode radio protocols through an AI-friendly Model Context Protocol interface.
 
 ## 🚀 Features
 
