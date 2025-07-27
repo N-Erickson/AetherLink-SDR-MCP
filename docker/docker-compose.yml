@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  sdr-mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: aetherlink:latest
+    container_name: aetherlink-server
+    
+    # Privileged mode needed for USB device access
+    privileged: true
+    
+    # Device access for RTL-SDR and HackRF
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    
+    volumes:
+      # Recordings directory
+      - ./recordings:/app/recordings
+      
+      # Config directory
+      - ./config:/app/config
+      
+      # Optional: Share system time
+      - /etc/localtime:/etc/localtime:ro
+    
+    environment:
+      # MCP configuration
+      - MCP_SERVER_NAME=aetherlink
+      
+      # SDR configuration
+      - SDR_DEFAULT_DEVICE=rtlsdr
+      - SDR_RECORDINGS_PATH=/app/recordings
+      
+      # Logging
+      - LOG_LEVEL=INFO
+      
+      # Optional: RTL-SDR specific
+      - RTLSDR_FREQ_CORRECTION=0
+      
+      # Optional: HackRF specific
+      - HACKRF_TX_ENABLED=false
+    
+    # For MCP stdio communication
+    stdin_open: true
+    tty: true
+    
+    # Network mode for development
+    # network_mode: host
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '1'
+          memory: 512M
+
+# Volumes for persistent data
+volumes:
+  recordings:
+    driver: local
+  config:
+    driver: local
+
+# Networks (optional)
+networks:
+  default:
+    name: aetherlink-network
