@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MCP server for SDR control with protocol decoding"
 authors = [{name = "Your Name", email = "your.email@example.com"}]
 license = {text = "MIT"}
-readme = "README.md"
+readme = "readme.md"
 requires-python = ">=3.10"
 keywords = ["sdr", "mcp", "rtl-sdr", "hackrf", "radio", "adsb"]
 classifiers = [
