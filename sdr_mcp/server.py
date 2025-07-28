@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 # MCP imports
 from mcp.server import Server
-from mcp.types import Tool, TextContent, Resource, ResourceContent, ResourceTemplate
+from mcp.types import Tool, TextContent, Resource
 import mcp.server.stdio
 
 # Import hardware drivers
@@ -265,7 +265,7 @@ class SDRMCPServer:
                             "averaging": {
                                 "type": "boolean",
                                 "description": "Enable spectrum averaging",
-                                "default": true
+                                "default": True
                             }
                         }
                     }
@@ -701,7 +701,7 @@ class SDRMCPServer:
             ]
             
         @self.server.read_resource()
-        async def read_resource(uri: str) -> ResourceContent:
+        async def read_resource(uri: str) -> str:
             """Read resource content"""
             if uri == "sdr://status":
                 if not self.sdr:
@@ -719,11 +719,7 @@ class SDRMCPServer:
                         is_capturing=self.sdr.is_capturing,
                         active_decoders=list(self.active_decoders.keys())
                     ))
-                return ResourceContent(
-                    uri=uri,
-                    mimeType="application/json",
-                    text=json.dumps(status, indent=2)
-                )
+                return json.dumps(status, indent=2)
                 
             elif uri == "aviation://aircraft":
                 aircraft_data = {
@@ -731,11 +727,7 @@ class SDRMCPServer:
                     "total_messages": self.adsb_decoder.message_count,
                     "decoder_active": "adsb" in self.active_decoders
                 }
-                return ResourceContent(
-                    uri=uri,
-                    mimeType="application/json",
-                    text=json.dumps(aircraft_data, indent=2, default=str)
-                )
+                return json.dumps(aircraft_data, indent=2, default=str)
                 
             elif uri == "spectrum://waterfall":
                 waterfall_data = self.spectrum_analyzer.get_waterfall_data(50)
@@ -745,29 +737,17 @@ class SDRMCPServer:
                     "center_freq": self.sdr.frequency if self.sdr else 0,
                     "sample_rate": self.sdr.sample_rate if self.sdr else 0
                 }
-                return ResourceContent(
-                    uri=uri,
-                    mimeType="application/json",
-                    text=json.dumps(data, indent=2)
-                )
+                return json.dumps(data, indent=2)
                 
             elif uri == "scan://results":
                 scan_data = {
                     "results": self.frequency_scanner.scan_results,
                     "summary": self.frequency_scanner.get_activity_summary()
                 }
-                return ResourceContent(
-                    uri=uri,
-                    mimeType="application/json",
-                    text=json.dumps(scan_data, indent=2, default=str)
-                )
+                return json.dumps(scan_data, indent=2, default=str)
                 
             else:
-                return ResourceContent(
-                    uri=uri,
-                    mimeType="text/plain",
-                    text=f"Unknown resource: {uri}"
-                )
+                return f"Unknown resource: {uri}"
                 
     async def _adsb_decoder_task(self):
         """Background task for ADS-B decoding"""
@@ -812,7 +792,7 @@ class SDRMCPServer:
             await self.server.run(
                 read_stream,
                 write_stream,
-                self.server._create_initialization_options()
+                self.server.create_initialization_options()
             )
 
 async def main():
