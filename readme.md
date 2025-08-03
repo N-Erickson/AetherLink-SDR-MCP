@@ -4,7 +4,7 @@ Control Software Defined Radios and decode radio protocols through an AI-friendl
 
 ## 🚀 Features
 
-- **Direct Hardware Control**: RTL-SDR and HackRF support without GNU Radio
+- **Direct Hardware Control**: RTL-SDR and HackRF
 - **Protocol Decoders**: ADS-B, AIS, NOAA weather satellites, amateur radio, and more
 - **Advanced Analysis**: Real-time spectrum analysis, waterfall displays, signal identification
 - **MCP Integration**: Seamless integration with Claude and other MCP clients
