@@ -143,7 +143,7 @@ You should see: "Successfully connected to RTL-SDR"
 - Uses `multimon-ng` for professional decoding
 - Supports 512/1200/2400 baud
 - Alphanumeric and numeric messages
-- 13 active frequencies found in Sioux Falls, SD
+- Common frequencies: 152.240 MHz, 454 MHz, 929-931 MHz
 
 **AIS (161.975/162.025 MHz):**
 - GMSK demodulation (simplified)
@@ -203,15 +203,17 @@ After 30-60 seconds:
 Show me the aircraft
 ```
 
-### Decode Pagers (Sioux Falls specific)
+### Decode Pagers
 ```
-Set frequency to 167.8625 MHz
+Set frequency to 152.240 MHz
 Start paging decoder at 1200 baud
 ```
 Wait a few minutes, then:
 ```
 Get pager messages
 ```
+
+Note: Check RadioReference.com for active pager frequencies in your area.
 
 ### Analyze Spectrum
 ```
@@ -293,7 +295,7 @@ Located in `tests/manual/` - **cannot run in CI**
 - `test_smooth_audio.py` - Quality verification
 
 **POCSAG Pagers:**
-- `scan_sioux_falls_pagers.py` - Scan 13 local frequencies
+- `test_live_pocsag.py` - Live pager decoding
 - `monitor_pagers.sh` - Long-term monitor (run for hours)
 
 **NOAA Satellites:**
@@ -316,26 +318,6 @@ python test_smooth_audio.py
 
 # See tests/manual/README.md for full details
 ```
-
-## 📍 Location-Specific Information
-
-### Sioux Falls, SD
-
-**Coordinates:** 43.5446°N, 96.7311°W
-
-**Active Pager Frequencies (13 found):**
-- 929.000 MHz - 900 MHz Paging (356 signals) - MOST ACTIVE
-- 931.000 MHz - 900 MHz Paging (331 signals)
-- 152.480 MHz - VHF Paging (330 signals)
-- 454.000 MHz - UHF Paging (327 signals)
-- **167.8625 MHz - VA Medical Center** (confirmed)
-- Plus 8 more active frequencies
-
-**NOAA Satellite Pass Lookup:**
-- https://www.n2yo.com/passes/?s=33591&lat=43.5446&lng=-96.7311
-- https://www.heavens-above.com/ (enter "Sioux Falls, SD")
-
-See [SIOUX_FALLS_RESULTS.md](SIOUX_FALLS_RESULTS.md) for complete details.
 
 ## 🔧 Development
 
@@ -388,18 +370,17 @@ AetherLink-SDR-MCP/
 
 ## 📚 Documentation
 
-- [FUNCTION_TEST_GUIDE.md](FUNCTION_TEST_GUIDE.md) - Complete testing guide
-- [SIOUX_FALLS_RESULTS.md](SIOUX_FALLS_RESULTS.md) - Local testing results
-- [REAL_WORLD_TESTING.md](REAL_WORLD_TESTING.md) - RF validation results
+- [tests/manual/README.md](tests/manual/README.md) - Manual testing guide
+- See tests/ directory for validation examples
 
 ## 🤝 Contributing
 
 This project is in active development. Current status:
 - ✅ ADS-B fully working and tested
 - ✅ POCSAG decoder integrated (multimon-ng)
-- ✅ 13 active pager frequencies identified (Sioux Falls)
-- ✅ All MCP tools implemented
-- ⏰ Waiting for real pager messages / satellite passes
+- ✅ Audio recording with FM/AM demodulation
+- ✅ All 23 MCP tools implemented
+- ⏰ Protocol decoders ready, waiting for signals
 
 ## 📄 License
 
