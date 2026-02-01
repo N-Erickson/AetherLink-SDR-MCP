@@ -261,34 +261,60 @@ Decode NOAA-19 satellite for 600 seconds
 
 ## 🧪 Testing
 
-### Test Scripts (in tests/ directory)
+### CI Tests (Automated)
+
+[![Sanity Checks](https://github.com/yourusername/AetherLink-SDR-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/AetherLink-SDR-MCP/actions/workflows/ci.yml)
+
+**What CI tests:**
+- ✅ Code imports without errors
+- ✅ Server initializes properly
+- ✅ DSP algorithms (FM/AM demod, AGC, resampling)
+- ✅ Decoders instantiate correctly
+
+**What CI does NOT test:**
+- ❌ Real SDR hardware (no USB on runners)
+- ❌ RF signal reception (no antennas in data centers)
+- ❌ Actual decoder performance
+
+Run CI tests locally:
+```bash
+pytest tests/test_sanity.py -v
+```
+
+### Manual Tests (Requires Hardware)
+
+Located in `tests/manual/` - **cannot run in CI**
 
 **ADS-B:**
 - `test_complete_adsb.py` - Full end-to-end test ✅ WORKING
 
+**Audio Recording:**
+- `test_audio_recording.py` - Basic functionality
+- `test_smooth_audio.py` - Quality verification
+
 **POCSAG Pagers:**
 - `scan_sioux_falls_pagers.py` - Scan 13 local frequencies
 - `monitor_pagers.sh` - Long-term monitor (run for hours)
-- `test_pocsag_decoder.py` - Unit tests
 
 **NOAA Satellites:**
-- `check_noaa_overhead.py` - Check if satellites overhead now
-- `test_noaa_apt_decoder.py` - Unit tests
+- `test_real_noaa.py` - Real satellite pass decoding
 
 **General:**
-- `test_all_functions.py` - Test all core SDR functions
+- `test_all_functions.py` - All core SDR functions
 
-### Running Tests
+### Running Manual Tests
 
 ```bash
-# Activate virtual environment
-source venv/bin/activate
+# Requires RTL-SDR/HackRF hardware connected
+cd tests/manual
 
-# Run specific test
-python tests/test_complete_adsb.py
+# ADS-B test (needs aircraft overhead)
+python test_complete_adsb.py
 
-# Run all unit tests
-python -m pytest tests/
+# Audio quality test (needs FM station)
+python test_smooth_audio.py
+
+# See tests/manual/README.md for full details
 ```
 
 ## 📍 Location-Specific Information
