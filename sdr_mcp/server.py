@@ -136,12 +136,13 @@ class ADSBDecoder:
         """Get list of all tracked aircraft"""
         now = datetime.now()
         active_aircraft = []
-        
+
         for icao, aircraft in self.aircraft.items():
-            # Only include aircraft seen in last 60 seconds
-            if (now - aircraft.last_seen).seconds < 60:
+            # Only include aircraft seen in last 120 seconds (2 minutes)
+            time_diff = (now - aircraft.last_seen).total_seconds()
+            if time_diff < 120:
                 active_aircraft.append(asdict(aircraft))
-                
+
         return active_aircraft
 
 class SDRMCPServer:
@@ -454,18 +455,22 @@ class SDRMCPServer:
                     if "adsb" in self.active_decoders:
                         return [TextContent(type="text", text="ADS-B tracking already active")]
 
-                    # Start ADS-B decoder task (rtl_adsb handles the SDR directly)
+                    # Start ADS-B decoder task (will handle SDR access)
                     try:
                         self.active_decoders["adsb"] = asyncio.create_task(self._adsb_decoder_task())
-                        # Give it a moment to start
-                        await asyncio.sleep(0.5)
-                        return [TextContent(type="text", text="Started ADS-B aircraft tracking on 1090 MHz using rtl_adsb")]
+                        await asyncio.sleep(2.0)  # Give it time to disconnect SDR and start rtl_adsb
+
+                        # Check if it failed immediately
+                        if self.active_decoders["adsb"].done():
+                            try:
+                                await self.active_decoders["adsb"]
+                            except Exception as e:
+                                del self.active_decoders["adsb"]
+                                return [TextContent(type="text", text=f"Failed to start ADS-B: {str(e)}\n\nMake sure the RTL-SDR is connected.")]
+
+                        return [TextContent(type="text", text="Started ADS-B aircraft tracking on 1090 MHz\n\nNOTE: Python SDR control is paused while tracking.\nUse aviation_stop_tracking to regain SDR control.")]
                     except Exception as e:
-                        return [TextContent(
-                            type="text",
-                            text=f"Failed to start ADS-B tracking: {str(e)}\n\n"
-                                 "Make sure rtl_adsb is installed and your RTL-SDR is connected."
-                        )]
+                        return [TextContent(type="text", text=f"Failed to start ADS-B tracking: {str(e)}")]
                     
                 elif name == "aviation_stop_tracking":
                     if "adsb" in self.active_decoders:
@@ -476,20 +481,32 @@ class SDRMCPServer:
                         return [TextContent(type="text", text="ADS-B tracking not active")]
                         
                 elif name == "aviation_get_aircraft":
+                    # Get aircraft list and log details
                     aircraft_list = self.adsb_decoder.get_aircraft_list()
-                    summary = f"Tracking {len(aircraft_list)} aircraft\n"
-                    summary += f"Total messages: {self.adsb_decoder.message_count}\n\n"
-                    
+                    total_tracked = len(self.adsb_decoder.aircraft)
+
+                    logger.info(f"Total aircraft ever seen: {total_tracked}")
+                    logger.info(f"Active aircraft (last 2 min): {len(aircraft_list)}")
+                    logger.info(f"Total messages decoded: {self.adsb_decoder.message_count}")
+
+                    summary = f"Tracking {len(aircraft_list)} active aircraft\n"
+                    summary += f"Total messages decoded: {self.adsb_decoder.message_count}\n"
+                    summary += f"Total aircraft seen: {total_tracked}\n\n"
+
+                    if not aircraft_list and total_tracked > 0:
+                        summary += "⚠️  Aircraft were detected but none are active in the last 2 minutes.\n"
+                        summary += "This is normal - aircraft may have flown out of range.\n\n"
+
                     for aircraft in aircraft_list:
                         summary += f"ICAO: {aircraft['icao']}"
                         if aircraft['callsign']:
                             summary += f" ({aircraft['callsign']})"
                         if aircraft['altitude']:
-                            summary += f" - Alt: {aircraft['altitude']} ft"
+                            summary += f" - Alt: {aircraft['altitude']:,.0f} ft"
                         if aircraft['speed']:
-                            summary += f" - Speed: {aircraft['speed']} kts"
+                            summary += f" - Speed: {aircraft['speed']:.0f} kts"
                         summary += f" - Messages: {aircraft['message_count']}\n"
-                        
+
                     return [TextContent(type="text", text=summary)]
                     
                 elif name == "spectrum_analyze":
@@ -751,61 +768,126 @@ class SDRMCPServer:
                 return f"Unknown resource: {uri}"
                 
     async def _adsb_decoder_task(self):
-        """Background task for ADS-B decoding using rtl_adsb"""
-        logger.info("Starting ADS-B decoder task with rtl_adsb")
-        self.sdr.is_capturing = True
+        """Background task for ADS-B decoding using rtl_adsb subprocess
 
+        NOTE: This temporarily disconnects Python SDR control and gives
+        exclusive access to rtl_adsb. Other SDR functions won't work while this runs.
+        Stop tracking to regain SDR control.
+        """
+        logger.info("Starting ADS-B decoder with rtl_adsb subprocess")
+
+        # Disconnect Python SDR to free the device
+        python_sdr_was_connected = self.sdr is not None
+        if self.sdr:
+            logger.info("Releasing SDR device for rtl_adsb")
+            await self.sdr.disconnect()
+            self.sdr = None
+
+            # Force garbage collection and wait for USB release
+            import gc
+            gc.collect()
+            await asyncio.sleep(0.5)  # Give OS time to release USB device
+            logger.info("USB device released")
+
+        process = None
         try:
-            # Start rtl_adsb as a subprocess
+            # Find rtl_adsb binary
+            import shutil
+            import os
+            rtl_adsb_path = shutil.which('rtl_adsb') or '/opt/homebrew/bin/rtl_adsb'
+
+            if not rtl_adsb_path or not os.path.exists(rtl_adsb_path):
+                logger.error(f"rtl_adsb not found! Checked: {rtl_adsb_path}")
+                raise FileNotFoundError(f"rtl_adsb not found at {rtl_adsb_path}")
+
+            logger.info(f"Found rtl_adsb at: {rtl_adsb_path}")
+            logger.info("Starting rtl_adsb subprocess...")
+
+            # Start rtl_adsb subprocess
             process = await asyncio.create_subprocess_exec(
-                'rtl_adsb',
+                rtl_adsb_path,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL
+                stderr=asyncio.subprocess.PIPE
             )
 
-            logger.info(f"Started rtl_adsb process (PID: {process.pid})")
+            logger.info(f"rtl_adsb started (PID: {process.pid})")
 
+            # Monitor stderr for errors
+            async def check_stderr():
+                first_lines = []
+                try:
+                    for _ in range(15):
+                        line = await asyncio.wait_for(process.stderr.readline(), timeout=0.3)
+                        if line:
+                            decoded = line.decode().strip()
+                            first_lines.append(decoded)
+                            logger.info(f"rtl_adsb: {decoded}")
+                            if 'error' in decoded.lower() or 'failed' in decoded.lower():
+                                logger.error(f"rtl_adsb ERROR: {decoded}")
+                except asyncio.TimeoutError:
+                    pass  # No more stderr
+                return first_lines
+
+            logger.info("Reading rtl_adsb startup messages...")
+            stderr_lines = await check_stderr()
+            logger.info(f"Got {len(stderr_lines)} stderr lines")
+
+            # Check if it started successfully
+            if any('Failed' in line or 'error -' in line for line in stderr_lines):
+                error_msg = '\n'.join(stderr_lines)
+                logger.error(f"rtl_adsb FAILED TO START:\n{error_msg}")
+                raise RuntimeError(f"rtl_adsb failed: {error_msg}")
+
+            msg_count = 0
+            decode_count = 0
+            last_log_time = asyncio.get_event_loop().time()
+
+            # Read and decode messages
             while True:
-                # Read line from rtl_adsb output
                 line = await process.stdout.readline()
                 if not line:
+                    logger.error("rtl_adsb output ended")
                     break
 
-                try:
-                    # Decode the line
-                    msg_line = line.decode('utf-8').strip()
+                msg_line = line.decode().strip()
+                if msg_line.startswith('*') and msg_line.endswith(';'):
+                    msg_count += 1
+                    msg_hex = msg_line[1:-1]  # Remove * and ;
 
-                    # Skip non-message lines
-                    if not msg_line.startswith('*') or not msg_line.endswith(';'):
-                        continue
-
-                    # Remove * and ; delimiters to get hex string
-                    msg_hex = msg_line[1:-1]
-
-                    # Decode the message (pyModeS expects hex string)
-                    if len(msg_hex) == 28:  # 14 bytes * 2 hex chars
+                    if len(msg_hex) == 28:
                         decoded = self.adsb_decoder.decode_message(msg_hex)
                         if decoded:
-                            logger.debug(f"Decoded ADS-B message from {decoded['icao']}")
+                            decode_count += 1
 
-                except Exception as e:
-                    logger.debug(f"Failed to decode line: {e}")
-                    continue
+                # Log every 10 seconds
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_log_time > 10:
+                    logger.info(f"ADS-B: {msg_count} msgs, {decode_count} decoded, {len(self.adsb_decoder.aircraft)} aircraft")
+                    last_log_time = current_time
 
         except asyncio.CancelledError:
-            logger.info("ADS-B decoder task cancelled")
-            if process:
-                process.terminate()
-                await process.wait()
-            self.sdr.is_capturing = False
+            logger.info("ADS-B tracking stopped by user")
             raise
         except Exception as e:
-            logger.error(f"ADS-B decoder task error: {e}")
+            import traceback
+            logger.error(f"ADS-B decoder error: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+        finally:
+            # Cleanup
             if process:
                 process.terminate()
-                await process.wait()
-            self.sdr.is_capturing = False
-            raise
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2.0)
+                except:
+                    process.kill()
+
+            # Reconnect Python SDR if it was connected before
+            if python_sdr_was_connected:
+                logger.info("Reconnecting Python SDR control")
+                from .hardware.rtlsdr import RTLSDRDevice
+                self.sdr = RTLSDRDevice()
+                await self.sdr.connect()
             
     async def _recording_task(self):
         """Background task for recording IQ samples"""
