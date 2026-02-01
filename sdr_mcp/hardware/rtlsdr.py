@@ -20,16 +20,19 @@ logger = logging.getLogger(__name__)
 
 class RTLSDRDevice(SDRDevice):
     """RTL-SDR hardware implementation"""
-    
+
     def __init__(self):
         super().__init__()
         self.device_name = "RTL-SDR"
-        
+
         # RTL-SDR specific limits
         self.min_frequency = 24e6      # 24 MHz
         self.max_frequency = 1.766e9   # 1.766 GHz
         self.min_sample_rate = 225e3   # 225 ksps
         self.max_sample_rate = 3.2e6   # 3.2 Msps
+
+        # Set safe default frequency (100 MHz FM broadcast)
+        self.frequency = 100e6
         
     async def connect(self) -> bool:
         """Connect to RTL-SDR device"""
@@ -74,7 +77,14 @@ class RTLSDRDevice(SDRDevice):
                 f"Frequency {freq/1e6:.3f} MHz out of RTL-SDR range "
                 f"({self.min_frequency/1e6:.1f}-{self.max_frequency/1e6:.1f} MHz)"
             )
-            
+
+        # E4000 tuner has a gap at 1084-1239 MHz - warn but don't fail
+        if 1084e6 <= freq <= 1239e6:
+            logger.warning(
+                f"Frequency {freq/1e6:.1f} MHz is in E4000 L-band gap (1084-1239 MHz). "
+                "The tuner may not lock properly at this frequency."
+            )
+
         self.frequency = freq
         if self.device:
             self.device.center_freq = freq

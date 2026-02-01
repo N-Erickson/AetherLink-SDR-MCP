@@ -77,31 +77,40 @@ class SpectrumAnalyzer:
         else:
             return np.ones(size)  # Rectangular window
             
-    def compute_psd(self, samples: np.ndarray, 
+    def compute_psd(self, samples: np.ndarray,
                     sample_rate: float) -> Tuple[np.ndarray, np.ndarray]:
         """Compute Power Spectral Density"""
+        # Ensure we have the right number of samples
+        num_samples = len(samples)
+
+        # Regenerate window if sample size changed
+        if num_samples != len(self.window):
+            self.window = self._get_window(self.window_type, num_samples)
+            self.fft_size = num_samples
+
         # Apply window
         windowed = samples * self.window
-        
+
         # Compute FFT
         spectrum = fftshift(fft(windowed))
-        
+
         # Compute power in dB
         power = np.abs(spectrum) ** 2
         power_db = 10 * np.log10(power + 1e-10)
-        
+
         # Normalize for window power
         window_power = np.sum(self.window ** 2)
         power_db -= 10 * np.log10(window_power)
-        
+
         # Generate frequency array
         freqs = fftshift(fftfreq(self.fft_size, 1/sample_rate))
-        
+
         return freqs, power_db
         
     def update_averaging(self, power_db: np.ndarray):
         """Update averaged spectrum and peak hold"""
-        if self.averaged_spectrum is None:
+        # Reset averaging buffers if size changed
+        if self.averaged_spectrum is None or len(self.averaged_spectrum) != len(power_db):
             self.averaged_spectrum = power_db.copy()
             self.peak_hold = power_db.copy()
         else:

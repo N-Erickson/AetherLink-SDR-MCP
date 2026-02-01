@@ -37,3 +37,11 @@ Thumbs.db
 # Project specific
 config.local.json
 *.log
+
+# Temporary test scripts (not part of main codebase)
+test_hardware.py
+test_hardware_simple.py
+test_mcp_tools.py
+test_mcp_server.py
+test_server_components.py
+verify_sdr.py
