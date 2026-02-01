@@ -9,8 +9,10 @@ from scipy import signal
 from scipy.fftpack import fft, fftshift, fftfreq
 import asyncio
 import json
+import os
 from datetime import datetime
 from collections import deque
+from pathlib import Path
 
 @dataclass
 class Signal:
@@ -287,8 +289,11 @@ class SpectrumAnalyzer:
 
 class SignalRecorder:
     """Record IQ samples and spectrum data"""
-    
-    def __init__(self, base_path: str = "./recordings"):
+
+    def __init__(self, base_path: str = None):
+        # Use /tmp/sdr_recordings as default - always writable
+        if base_path is None:
+            base_path = "/tmp/sdr_recordings"
         self.base_path = base_path
         self.current_recording = None
         self.recording_metadata = {}
@@ -311,9 +316,8 @@ class SignalRecorder:
             "description": description,
             "samples_recorded": 0
         }
-        
+
         # Create recording file
-        import os
         os.makedirs(self.base_path, exist_ok=True)
         self.current_recording = open(
             f"{self.base_path}/{recording_id}.iq", 
