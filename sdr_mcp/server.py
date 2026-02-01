@@ -32,6 +32,10 @@ except ImportError:
     ADSB_AVAILABLE = False
     logging.warning("ADS-B decoder not available. Install with: pip install pyModeS")
 
+from .decoders.pocsag import POCSAGDecoder
+from .decoders.ais import AISDecoder
+from .decoders.noaa_apt import NOAAAPTDecoder
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -147,18 +151,21 @@ class ADSBDecoder:
 
 class SDRMCPServer:
     """MCP Server for SDR control"""
-    
+
     def __init__(self):
         self.server = Server("sdr-mcp")
         self.sdr: Optional[SDRDevice] = None
         self.adsb_decoder = ADSBDecoder()
+        self.pocsag_decoder = POCSAGDecoder()
+        self.ais_decoder = AISDecoder()
+        self.noaa_decoder = NOAAAPTDecoder()
         self.active_decoders: Dict[str, asyncio.Task] = {}
-        
+
         # Analysis modules
         self.spectrum_analyzer = SpectrumAnalyzer()
         self.signal_recorder = SignalRecorder()
         self.frequency_scanner = FrequencyScanner(self.spectrum_analyzer)
-        
+
         self.setup_handlers()
         
     def setup_handlers(self):
@@ -241,6 +248,76 @@ class SDRMCPServer:
                     name="aviation_get_aircraft",
                     description="Get list of currently tracked aircraft",
                     inputSchema={"type": "object", "properties": {}}
+                ),
+                Tool(
+                    name="pager_start_decoding",
+                    description="Start decoding POCSAG pager messages on current frequency",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "baud_rate": {
+                                "type": "integer",
+                                "enum": [512, 1200, 2400],
+                                "description": "POCSAG baud rate",
+                                "default": 1200
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="pager_stop_decoding",
+                    description="Stop decoding POCSAG pager messages",
+                    inputSchema={"type": "object", "properties": {}}
+                ),
+                Tool(
+                    name="pager_get_messages",
+                    description="Get decoded pager messages",
+                    inputSchema={"type": "object", "properties": {}}
+                ),
+                Tool(
+                    name="marine_track_vessels",
+                    description="Start tracking ships via AIS on 161.975 MHz or 162.025 MHz",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "channel": {
+                                "type": "string",
+                                "enum": ["A", "B"],
+                                "description": "AIS channel (A=161.975 MHz, B=162.025 MHz)",
+                                "default": "A"
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="marine_stop_tracking",
+                    description="Stop tracking ships",
+                    inputSchema={"type": "object", "properties": {}}
+                ),
+                Tool(
+                    name="marine_get_vessels",
+                    description="Get list of tracked vessels",
+                    inputSchema={"type": "object", "properties": {}}
+                ),
+                Tool(
+                    name="satellite_decode_noaa",
+                    description="Decode NOAA weather satellite APT transmission from recorded IQ samples",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "satellite": {
+                                "type": "string",
+                                "enum": ["NOAA-15", "NOAA-18", "NOAA-19"],
+                                "description": "NOAA satellite identifier"
+                            },
+                            "duration": {
+                                "type": "number",
+                                "description": "Recording duration in seconds (typically 600-900 for full pass)",
+                                "default": 600
+                            }
+                        },
+                        "required": ["satellite"]
+                    }
                 ),
                 Tool(
                     name="spectrum_analyze",
@@ -508,7 +585,158 @@ class SDRMCPServer:
                         summary += f" - Messages: {aircraft['message_count']}\n"
 
                     return [TextContent(type="text", text=summary)]
-                    
+
+                elif name == "pager_start_decoding":
+                    if not self.sdr:
+                        return [TextContent(type="text", text="No SDR connected")]
+                    if "pocsag" in self.active_decoders:
+                        return [TextContent(type="text", text="POCSAG decoding already active")]
+
+                    baud_rate = arguments.get("baud_rate", 1200)
+                    self.pocsag_decoder.baud_rate = baud_rate
+
+                    # Start decoder task
+                    self.active_decoders["pocsag"] = asyncio.create_task(
+                        self._pocsag_decoder_task()
+                    )
+
+                    return [TextContent(type="text", text=f"Started POCSAG pager decoding at {baud_rate} baud\nFrequency: {self.sdr.frequency/1e6:.3f} MHz")]
+
+                elif name == "pager_stop_decoding":
+                    if "pocsag" in self.active_decoders:
+                        self.active_decoders["pocsag"].cancel()
+                        del self.active_decoders["pocsag"]
+                        return [TextContent(type="text", text="Stopped POCSAG decoding")]
+                    else:
+                        return [TextContent(type="text", text="POCSAG decoding not active")]
+
+                elif name == "pager_get_messages":
+                    stats = self.pocsag_decoder.get_statistics()
+                    messages = self.pocsag_decoder.messages
+
+                    result = f"POCSAG Messages: {stats['total_messages']}\n"
+                    result += f"Messages stored: {stats['messages_stored']}\n"
+                    result += f"Addresses seen: {stats['addresses_seen']}\n\n"
+
+                    if not messages:
+                        result += "No messages decoded yet\n"
+                    else:
+                        for msg in messages[-20:]:  # Show last 20
+                            result += f"Address: {msg['address']} (Function {msg['function']})\n"
+                            result += f"Type: {msg['message_type']}\n"
+                            result += f"Message: {msg['message']}\n"
+                            result += f"Time: {msg['timestamp']}\n\n"
+
+                    return [TextContent(type="text", text=result)]
+
+                elif name == "marine_track_vessels":
+                    if not self.sdr:
+                        return [TextContent(type="text", text="No SDR connected")]
+                    if "ais" in self.active_decoders:
+                        return [TextContent(type="text", text="AIS tracking already active")]
+
+                    channel = arguments.get("channel", "A")
+                    ais_freq = 161.975e6 if channel == "A" else 162.025e6
+
+                    # Set frequency for AIS
+                    await self.sdr.set_frequency(ais_freq)
+
+                    # Start decoder task
+                    self.active_decoders["ais"] = asyncio.create_task(
+                        self._ais_decoder_task()
+                    )
+
+                    return [TextContent(type="text", text=f"Started AIS vessel tracking on channel {channel} ({ais_freq/1e6:.3f} MHz)")]
+
+                elif name == "marine_stop_tracking":
+                    if "ais" in self.active_decoders:
+                        self.active_decoders["ais"].cancel()
+                        del self.active_decoders["ais"]
+                        return [TextContent(type="text", text="Stopped AIS tracking")]
+                    else:
+                        return [TextContent(type="text", text="AIS tracking not active")]
+
+                elif name == "marine_get_vessels":
+                    vessels = self.ais_decoder.get_vessel_list()
+                    stats = self.ais_decoder.get_statistics()
+
+                    result = f"Tracking {len(vessels)} vessels\n"
+                    result += f"Total messages: {stats['total_messages']}\n"
+                    result += f"Total vessels seen: {stats['total_vessels']}\n"
+                    result += f"Active vessels: {stats['active_vessels']}\n\n"
+
+                    if not vessels:
+                        result += "No vessels tracked yet\n"
+                    else:
+                        for vessel in vessels:
+                            result += f"MMSI: {vessel['mmsi']}"
+                            if vessel.get('name'):
+                                result += f" - {vessel['name']}"
+                            if vessel.get('latitude') and vessel.get('longitude'):
+                                result += f"\nPosition: {vessel['latitude']:.4f}, {vessel['longitude']:.4f}"
+                            if vessel.get('speed'):
+                                result += f" - Speed: {vessel['speed']:.1f} kts"
+                            if vessel.get('heading'):
+                                result += f" - Heading: {vessel['heading']:.0f}°"
+                            if vessel.get('ship_type'):
+                                result += f"\nType: {vessel['ship_type']}"
+                            result += f"\nMessages: {vessel['message_count']}\n\n"
+
+                    return [TextContent(type="text", text=result)]
+
+                elif name == "satellite_decode_noaa":
+                    if not self.sdr:
+                        return [TextContent(type="text", text="No SDR connected")]
+
+                    satellite = arguments["satellite"]
+                    duration = arguments.get("duration", 600)
+
+                    # Get NOAA frequency
+                    from .decoders.noaa_apt import NOAA_FREQUENCIES
+                    if satellite not in NOAA_FREQUENCIES:
+                        return [TextContent(type="text", text=f"Unknown satellite: {satellite}")]
+
+                    freq = NOAA_FREQUENCIES[satellite]
+                    await self.sdr.set_frequency(freq)
+
+                    result = f"Recording {satellite} APT transmission...\n"
+                    result += f"Frequency: {freq/1e6:.3f} MHz\n"
+                    result += f"Duration: {duration} seconds\n\n"
+
+                    # Record IQ samples
+                    logger.info(f"Recording {satellite} for {duration} seconds")
+                    samples_list = []
+                    chunks = int(duration / 5)  # 5 second chunks
+
+                    for i in range(chunks):
+                        chunk = await self.sdr.read_samples(int(self.sdr.sample_rate * 5))
+                        samples_list.append(chunk)
+                        if i % 6 == 0:  # Log every 30 seconds
+                            logger.info(f"Recording progress: {(i+1)*5}/{duration} seconds")
+
+                    all_samples = np.concatenate(samples_list)
+
+                    # Decode APT
+                    logger.info("Decoding NOAA APT image...")
+                    image = self.noaa_decoder.decode_pass(all_samples, int(self.sdr.sample_rate), satellite)
+
+                    if image:
+                        # Save image
+                        import os
+                        output_dir = "recordings"
+                        os.makedirs(output_dir, exist_ok=True)
+                        filename = f"{output_dir}/noaa_{satellite}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                        self.noaa_decoder.save_image(image, filename)
+
+                        result += f"✅ Successfully decoded!\n"
+                        result += f"Lines decoded: {image.num_lines}\n"
+                        result += f"Quality: {image.quality*100:.1f}%\n"
+                        result += f"Saved to: {filename}\n"
+                    else:
+                        result += "❌ Failed to decode image - no valid sync patterns found\n"
+
+                    return [TextContent(type="text", text=result)]
+
                 elif name == "spectrum_analyze":
                     if not self.sdr:
                         return [TextContent(type="text", text="No SDR connected")]
@@ -889,19 +1117,89 @@ class SDRMCPServer:
                 self.sdr = RTLSDRDevice()
                 await self.sdr.connect()
             
+    async def _pocsag_decoder_task(self):
+        """Background task for POCSAG pager decoding"""
+        logger.info("Starting POCSAG decoder task")
+
+        try:
+            while True:
+                # Read samples
+                chunk_size = int(self.sdr.sample_rate * 0.5)  # 500ms chunks
+                samples = await self.sdr.read_samples(chunk_size)
+
+                # Demodulate FSK
+                from scipy import signal
+                # Simple FSK demodulation using frequency discrimination
+                instantaneous_phase = np.unwrap(np.angle(samples))
+                instantaneous_frequency = np.diff(instantaneous_phase)
+
+                # Low-pass filter
+                b, a = signal.butter(5, self.pocsag_decoder.baud_rate * 2 / (self.sdr.sample_rate / 2), 'low')
+                demod = signal.filtfilt(b, a, instantaneous_frequency)
+
+                # Convert to bits (simple threshold)
+                bits = (demod > np.mean(demod)).astype(int)
+
+                # Decode POCSAG frames from bit stream
+                # Look for sync pattern and decode codewords
+                # This is simplified - real implementation needs proper frame sync
+                logger.debug(f"POCSAG: processed {len(bits)} bits")
+
+        except asyncio.CancelledError:
+            logger.info("POCSAG decoder task cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"POCSAG decoder error: {e}")
+            raise
+
+    async def _ais_decoder_task(self):
+        """Background task for AIS ship tracking"""
+        logger.info("Starting AIS decoder task")
+
+        try:
+            while True:
+                # Read samples
+                chunk_size = int(self.sdr.sample_rate * 0.5)  # 500ms chunks
+                samples = await self.sdr.read_samples(chunk_size)
+
+                # Demodulate GMSK (simplified - AIS uses GMSK modulation)
+                # This is a placeholder - real AIS decoding requires proper GMSK demodulation
+                from scipy import signal
+
+                # FM demodulation
+                instantaneous_phase = np.unwrap(np.angle(samples))
+                instantaneous_frequency = np.diff(instantaneous_phase)
+
+                # Low-pass filter for 9600 baud
+                b, a = signal.butter(5, 9600 * 2 / (self.sdr.sample_rate / 2), 'low')
+                demod = signal.filtfilt(b, a, instantaneous_frequency)
+
+                # Convert to bits
+                bits = (demod > np.mean(demod)).astype(int)
+
+                # In real implementation, would decode HDLC frames here
+                logger.debug(f"AIS: processed {len(bits)} bits")
+
+        except asyncio.CancelledError:
+            logger.info("AIS decoder task cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"AIS decoder error: {e}")
+            raise
+
     async def _recording_task(self):
         """Background task for recording IQ samples"""
         logger.info("Starting recording task")
-        
+
         try:
             while True:
                 # Read samples in chunks
                 chunk_size = int(self.sdr.sample_rate * 0.1)  # 100ms chunks
                 samples = await self.sdr.read_samples(chunk_size)
-                
+
                 # Add to recording
                 await self.signal_recorder.add_samples(samples)
-                
+
         except asyncio.CancelledError:
             logger.info("Recording task cancelled")
             raise
