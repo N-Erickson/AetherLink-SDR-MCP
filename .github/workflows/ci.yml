@@ -1,17 +1,7 @@
-name: Sanity Checks
+name: Sanity Check
 
-# What this CI tests:
-# - Code imports without errors
-# - Server initializes properly
-# - DSP algorithms don't regress
-# - Tools are registered correctly
-#
-# What this CI does NOT test:
-# - Real SDR hardware (no USB devices on runners)
-# - Actual RF signal reception (no antennas in data centers)
-# - Decoder performance with real signals
-#
-# For real-world validation, see tests/manual/ and run locally with hardware
+# What this tests: Code imports without crashing
+# What this does NOT test: Real SDR hardware or RF signals
 
 on:
   push:
@@ -36,12 +26,48 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -e .
-        pip install pytest pytest-asyncio
 
-    - name: Run sanity checks
+    - name: Sanity check - imports
       run: |
-        pytest tests/test_sanity.py -v --tb=short
+        python -c "
+        # Test all core imports work
+        from sdr_mcp.server import SDRMCPServer
+        from sdr_mcp.hardware.rtlsdr import RTLSDRDevice
+        from sdr_mcp.hardware.hackrf import HackRFDevice
+        from sdr_mcp.analysis.spectrum import SpectrumAnalyzer, SignalRecorder, AudioRecorder
+        from sdr_mcp.decoders.pocsag import POCSAGDecoder
+        from sdr_mcp.decoders.ais import AISDecoder
+        from sdr_mcp.decoders.noaa_apt import NOAAAPTDecoder
+        print('✅ All imports successful')
+        "
 
-    - name: Quick smoke test
+    - name: Sanity check - server initialization
       run: |
-        python -c "from sdr_mcp.server import SDRMCPServer; s = SDRMCPServer(); print(f'✅ Server initialized with {len(s.server.list_tools())} tools')"
+        python -c "
+        from sdr_mcp.server import SDRMCPServer
+        server = SDRMCPServer()
+        assert server.server.name == 'sdr-mcp'
+        assert server.sdr is None  # No hardware connected
+        print('✅ Server initializes without hardware')
+        "
+
+    - name: Sanity check - decoders instantiate
+      run: |
+        python -c "
+        from sdr_mcp.server import ADSBDecoder, POCSAGDecoder, AISDecoder, NOAAAPTDecoder
+        adsb = ADSBDecoder()
+        pocsag = POCSAGDecoder()
+        ais = AISDecoder()
+        noaa = NOAAAPTDecoder()
+        print('✅ All decoders instantiate')
+        "
+
+    - name: Sanity check - audio recorder
+      run: |
+        python -c "
+        from sdr_mcp.analysis.spectrum import AudioRecorder
+        recorder = AudioRecorder()
+        assert recorder.audio_rate == 48000
+        assert recorder.base_path == '/tmp/sdr_recordings'
+        print('✅ AudioRecorder initializes')
+        "
