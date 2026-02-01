@@ -44,4 +44,8 @@ test_hardware_simple.py
 test_mcp_tools.py
 test_mcp_server.py
 test_server_components.py
+test_mcp_stdio.py
 verify_sdr.py
+
+# Setup documentation (user-specific)
+SETUP_CLAUDE_DESKTOP.md
