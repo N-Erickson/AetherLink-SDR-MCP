@@ -22,7 +22,7 @@ from .hardware.rtlsdr import RTLSDRDevice, RTLSDR_AVAILABLE
 from .hardware.hackrf import HackRFDevice, HACKRF_AVAILABLE, HackRFMode
 
 # Import analysis modules
-from .analysis.spectrum import SpectrumAnalyzer, SignalRecorder, FrequencyScanner
+from .analysis.spectrum import SpectrumAnalyzer, SignalRecorder, FrequencyScanner, AudioRecorder
 
 # Protocol decoder imports
 try:
@@ -164,6 +164,7 @@ class SDRMCPServer:
         # Analysis modules
         self.spectrum_analyzer = SpectrumAnalyzer()
         self.signal_recorder = SignalRecorder()
+        self.audio_recorder = AudioRecorder()
         self.frequency_scanner = FrequencyScanner(self.spectrum_analyzer)
 
         self.setup_handlers()
@@ -394,6 +395,31 @@ class SDRMCPServer:
                 Tool(
                     name="recording_stop",
                     description="Stop current recording",
+                    inputSchema={"type": "object", "properties": {}}
+                ),
+                Tool(
+                    name="audio_record_start",
+                    description="Start recording demodulated audio (FM/AM) to WAV file",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "modulation": {
+                                "type": "string",
+                                "description": "Modulation type: FM or AM",
+                                "enum": ["FM", "AM"],
+                                "default": "FM"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Recording description",
+                                "default": ""
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="audio_record_stop",
+                    description="Stop current audio recording",
                     inputSchema={"type": "object", "properties": {}}
                 ),
                 Tool(
@@ -846,18 +872,58 @@ class SDRMCPServer:
                     if "recorder" in self.active_decoders:
                         self.active_decoders["recorder"].cancel()
                         del self.active_decoders["recorder"]
-                        
+
                         metadata = await self.signal_recorder.stop_recording()
-                        
+
                         result = f"Recording stopped:\n"
                         result += f"- ID: {metadata.get('id', 'N/A')}\n"
                         result += f"- Duration: {metadata.get('duration', 0):.1f} seconds\n"
                         result += f"- Samples: {metadata.get('samples_recorded', 0):,}\n"
-                        
+
                         return [TextContent(type="text", text=result)]
                     else:
                         return [TextContent(type="text", text="No recording in progress")]
-                        
+
+                elif name == "audio_record_start":
+                    if not self.sdr:
+                        return [TextContent(type="text", text="No SDR connected")]
+
+                    modulation = arguments.get("modulation", "FM")
+                    description = arguments.get("description", "")
+
+                    # Start audio recording
+                    recording_id = await self.audio_recorder.start_recording(
+                        self.sdr.frequency,
+                        self.sdr.sample_rate,
+                        modulation,
+                        description
+                    )
+
+                    # Start audio recording task
+                    self.active_decoders["audio_recorder"] = asyncio.create_task(
+                        self._audio_recording_task(modulation)
+                    )
+
+                    return [TextContent(type="text", text=f"Started audio recording ({modulation}): {recording_id}\nSaving to: /tmp/sdr_recordings/{recording_id}.wav")]
+
+                elif name == "audio_record_stop":
+                    if "audio_recorder" in self.active_decoders:
+                        self.active_decoders["audio_recorder"].cancel()
+                        del self.active_decoders["audio_recorder"]
+
+                        metadata = await self.audio_recorder.stop_recording()
+
+                        result = f"Audio recording stopped:\n"
+                        result += f"- ID: {metadata.get('id', 'N/A')}\n"
+                        result += f"- Duration: {metadata.get('duration', 0):.1f} seconds\n"
+                        result += f"- Audio samples: {metadata.get('samples_recorded', 0):,}\n"
+                        result += f"- Modulation: {metadata.get('modulation', 'N/A')}\n"
+                        result += f"- File: /tmp/sdr_recordings/{metadata.get('id', 'N/A')}.wav"
+
+                        return [TextContent(type="text", text=result)]
+                    else:
+                        return [TextContent(type="text", text="No audio recording in progress")]
+
                 elif name == "hackrf_set_tx_gain":
                     if not isinstance(self.sdr, HackRFDevice):
                         return [TextContent(type="text", text="This command requires a HackRF device")]
@@ -1203,7 +1269,28 @@ class SDRMCPServer:
         except asyncio.CancelledError:
             logger.info("Recording task cancelled")
             raise
-            
+
+    async def _audio_recording_task(self, modulation: str = "FM"):
+        """Background task for recording demodulated audio"""
+        logger.info(f"Starting audio recording task ({modulation})")
+
+        try:
+            while True:
+                # Read samples in chunks
+                chunk_size = int(self.sdr.sample_rate * 0.1)  # 100ms chunks
+                samples = await self.sdr.read_samples(chunk_size)
+
+                # Demodulate and add to audio recording
+                await self.audio_recorder.add_samples(
+                    samples,
+                    self.sdr.sample_rate,
+                    modulation
+                )
+
+        except asyncio.CancelledError:
+            logger.info("Audio recording task cancelled")
+            raise
+
     async def run(self):
         """Run the MCP server"""
         async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):

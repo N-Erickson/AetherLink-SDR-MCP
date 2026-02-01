@@ -7,8 +7,9 @@ Control Software Defined Radios and decode radio protocols through an AI-friendl
 - **Direct Hardware Control**: RTL-SDR and HackRF One
 - **Protocol Decoders**: ADS-B aircraft tracking, POCSAG pagers, AIS ship tracking, NOAA weather satellites
 - **Advanced Analysis**: Real-time spectrum analysis, waterfall displays, signal detection, frequency scanning
+- **Audio Recording**: Demodulate and record FM/AM audio as WAV files
 - **MCP Integration**: Seamless integration with Claude Desktop and other MCP clients
-- **21 MCP Tools**: Complete SDR control through natural language
+- **23 MCP Tools**: Complete SDR control through natural language
 
 ## 📦 Installation
 
@@ -154,7 +155,7 @@ You should see: "Successfully connected to RTL-SDR"
 - Decodes weather satellite images
 - Requires satellite overhead (2 passes/day)
 
-## 🛠️ Available MCP Tools (21 Total)
+## 🛠️ Available MCP Tools (23 Total)
 
 ### Core SDR Control (5 tools)
 - `sdr_connect` - Connect to RTL-SDR or HackRF
@@ -181,10 +182,11 @@ You should see: "Successfully connected to RTL-SDR"
 ### Satellite (1 tool)
 - `satellite_decode_noaa` - Decode NOAA weather satellite pass
 
-### Analysis (3 tools)
+### Analysis (5 tools)
 - `spectrum_analyze` - Analyze RF spectrum (FFT, signal detection)
 - `spectrum_scan` - Scan frequency range
-- `recording_start`/`recording_stop` - Record IQ samples (saved to `/tmp/sdr_recordings/`)
+- `recording_start`/`recording_stop` - Record raw IQ samples (saved to `/tmp/sdr_recordings/`)
+- `audio_record_start`/`audio_record_stop` - Record demodulated audio as WAV (FM/AM)
 
 ### HackRF Transmit (2 tools)
 - `hackrf_set_tx_gain` - Set transmit gain
@@ -222,16 +224,35 @@ Analyze the spectrum
 Scan from 430 MHz to 440 MHz with 1 MHz steps
 ```
 
-### Record IQ Samples
+### Record Audio from FM Radio
 ```
 Set frequency to 103.7 MHz
-Start recording with description "Local FM station"
+Start audio recording with FM modulation and description "Local FM station"
+```
+Wait for desired duration (e.g., 30 seconds), then:
+```
+Stop audio recording
+```
+Files saved to: `/tmp/sdr_recordings/audio_YYYYMMDD_HHMMSS_XXXMHz_FM.wav`
+
+**Features:**
+- FM demodulation with 75μs de-emphasis (US standard)
+- AM demodulation with envelope detection
+- 48 kHz WAV output (playable with any audio player)
+- Automatic normalization to prevent clipping
+
+### Record Raw IQ Samples
+```
+Set frequency to 103.7 MHz
+Start recording with description "Raw baseband data"
 ```
 Wait for desired duration, then:
 ```
 Stop recording
 ```
 Files saved to: `/tmp/sdr_recordings/recording_YYYYMMDD_HHMMSS_XXXMHz.iq`
+
+**Use case:** Advanced analysis, replay, or processing with GNU Radio/SDR#
 
 ### NOAA Satellite (when overhead)
 ```

@@ -10,6 +10,7 @@ from scipy.fftpack import fft, fftshift, fftfreq
 import asyncio
 import json
 import os
+import wave
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -441,11 +442,216 @@ class FrequencyScanner:
         """Find the strongest signal from scan"""
         strongest = None
         max_power = -200
-        
+
         for result in self.scan_results:
             for sig in result["signals"]:
                 if sig["power"] > max_power:
                     max_power = sig["power"]
                     strongest = sig
-                    
+
         return strongest
+
+class AudioRecorder:
+    """Record demodulated audio from FM/AM signals"""
+
+    def __init__(self, base_path: str = None):
+        # Use /tmp/sdr_recordings as default - always writable
+        if base_path is None:
+            base_path = "/tmp/sdr_recordings"
+        self.base_path = base_path
+        self.current_recording = None
+        self.recording_metadata = {}
+        self.audio_rate = 48000  # Standard audio sample rate
+
+        # For smooth audio - track previous samples for continuity
+        self.last_phase = 0.0
+        self.dc_filter_state = 0.0
+
+        # AGC (Automatic Gain Control) instead of per-chunk normalization
+        self.agc_gain = 0.1
+        self.agc_target = 0.3  # Target RMS level (leave headroom)
+
+    def _fm_demodulate(self, samples: np.ndarray) -> np.ndarray:
+        """FM demodulation using phase difference with continuity"""
+        # Calculate instantaneous phase
+        phase = np.unwrap(np.angle(samples))
+
+        # Use last phase from previous chunk for continuity
+        if self.last_phase != 0.0:
+            # Adjust phase to be continuous with previous chunk
+            phase_offset = self.last_phase - phase[0]
+            phase = phase + phase_offset
+
+        # Store last phase for next chunk
+        self.last_phase = phase[-1]
+
+        # Phase difference (derivative) - this is the demodulated signal
+        phase_diff = np.diff(phase)
+
+        # Pad to maintain same length
+        phase_diff = np.append(phase_diff, phase_diff[-1])
+
+        return phase_diff
+
+    def _am_demodulate(self, samples: np.ndarray) -> np.ndarray:
+        """AM demodulation using envelope detection with DC filter"""
+        # Calculate envelope (magnitude)
+        envelope = np.abs(samples)
+
+        # High-pass filter to remove DC (continuous across chunks)
+        alpha = 0.95  # Filter coefficient
+        filtered = np.zeros_like(envelope)
+        filtered[0] = envelope[0] - self.dc_filter_state
+
+        for i in range(1, len(envelope)):
+            filtered[i] = alpha * (filtered[i-1] + envelope[i] - envelope[i-1])
+
+        self.dc_filter_state = envelope[-1]
+
+        return filtered
+
+    def _resample(self, audio: np.ndarray,
+                  original_rate: float,
+                  target_rate: float) -> np.ndarray:
+        """Resample audio to target rate using polyphase filtering"""
+        if original_rate == target_rate:
+            return audio
+
+        # Use scipy's resample_poly for better quality (less artifacts)
+        from scipy.signal import resample_poly
+
+        # Find greatest common divisor for efficient resampling
+        from math import gcd
+        ratio_num = int(target_rate)
+        ratio_den = int(original_rate)
+        common = gcd(ratio_num, ratio_den)
+        up = ratio_num // common
+        down = ratio_den // common
+
+        # Resample using polyphase filtering
+        return resample_poly(audio, up, down)
+
+    def _apply_deemphasis(self, audio: np.ndarray,
+                          sample_rate: float,
+                          tau: float = 75e-6) -> np.ndarray:
+        """Apply FM de-emphasis filter (75μs for US, 50μs for EU)"""
+        # De-emphasis filter time constant
+        # H(s) = 1 / (1 + s*tau)
+
+        d = sample_rate * tau
+        x = np.exp(-1.0 / d)
+
+        # Simple IIR filter
+        output = np.zeros_like(audio)
+        output[0] = audio[0]
+
+        for i in range(1, len(audio)):
+            output[i] = audio[i] * (1 - x) + output[i-1] * x
+
+        return output
+
+    async def start_recording(self,
+                              center_freq: float,
+                              sample_rate: float,
+                              modulation: str = "FM",
+                              description: str = "") -> str:
+        """Start a new audio recording"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        recording_id = f"audio_{timestamp}_{int(center_freq/1e6)}MHz_{modulation}"
+
+        # Reset state variables for new recording
+        self.last_phase = 0.0
+        self.dc_filter_state = 0.0
+        self.agc_gain = 0.1
+
+        self.recording_metadata = {
+            "id": recording_id,
+            "start_time": datetime.now().isoformat(),
+            "center_freq": center_freq,
+            "sample_rate": sample_rate,
+            "modulation": modulation.upper(),
+            "description": description,
+            "audio_rate": self.audio_rate,
+            "samples_recorded": 0
+        }
+
+        # Create recording directory
+        os.makedirs(self.base_path, exist_ok=True)
+
+        # Create WAV file
+        wav_path = f"{self.base_path}/{recording_id}.wav"
+        self.current_recording = wave.open(wav_path, 'wb')
+        self.current_recording.setnchannels(1)  # Mono
+        self.current_recording.setsampwidth(2)  # 16-bit
+        self.current_recording.setframerate(self.audio_rate)
+
+        return recording_id
+
+    async def add_samples(self, samples: np.ndarray,
+                         sample_rate: float,
+                         modulation: str = "FM"):
+        """Demodulate and add audio samples to recording"""
+        if not self.current_recording:
+            return
+
+        # Demodulate based on type
+        if modulation.upper() == "FM":
+            audio = self._fm_demodulate(samples)
+            # Apply de-emphasis for FM broadcast
+            audio = self._apply_deemphasis(audio, sample_rate)
+        elif modulation.upper() == "AM":
+            audio = self._am_demodulate(samples)
+        else:
+            # Default to FM
+            audio = self._fm_demodulate(samples)
+
+        # Resample to audio rate
+        audio = self._resample(audio, sample_rate, self.audio_rate)
+
+        # Apply AGC (Automatic Gain Control) for smooth volume
+        if len(audio) > 0:
+            # Calculate RMS level
+            rms = np.sqrt(np.mean(audio ** 2))
+
+            # Update gain smoothly
+            if rms > 0:
+                target_gain = self.agc_target / rms
+                # Smooth gain changes to avoid artifacts
+                self.agc_gain = 0.9 * self.agc_gain + 0.1 * target_gain
+                # Limit gain to prevent excessive amplification
+                self.agc_gain = min(self.agc_gain, 10.0)
+
+            # Apply gain
+            audio = audio * self.agc_gain
+
+            # Soft clipping to prevent hard clipping artifacts
+            audio = np.tanh(audio)
+
+        # Convert to 16-bit PCM
+        audio_int16 = (audio * 32767 * 0.9).astype(np.int16)  # 0.9 for headroom
+
+        # Write to WAV file
+        self.current_recording.writeframes(audio_int16.tobytes())
+        self.recording_metadata["samples_recorded"] += len(audio_int16)
+
+    async def stop_recording(self) -> Dict[str, Any]:
+        """Stop current audio recording"""
+        if self.current_recording:
+            self.current_recording.close()
+            self.current_recording = None
+
+            # Save metadata
+            self.recording_metadata["end_time"] = datetime.now().isoformat()
+            self.recording_metadata["duration"] = (
+                datetime.fromisoformat(self.recording_metadata["end_time"]) -
+                datetime.fromisoformat(self.recording_metadata["start_time"])
+            ).total_seconds()
+
+            # Write metadata file
+            metadata_file = f"{self.base_path}/{self.recording_metadata['id']}.json"
+            with open(metadata_file, "w") as f:
+                json.dump(self.recording_metadata, f, indent=2)
+
+            return self.recording_metadata
+
+        return {}
