@@ -452,18 +452,48 @@ class SDRMCPServer:
                 elif name == "aviation_track_aircraft":
                     if not self.sdr:
                         return [TextContent(type="text", text="No SDR connected")]
-                    
+
                     if "adsb" in self.active_decoders:
                         return [TextContent(type="text", text="ADS-B tracking already active")]
-                        
+
+                    # Check if frequency is in E4000 gap
+                    if 1084e6 <= ADSB_FREQUENCY <= 1239e6:
+                        tuner_info = await self.sdr.get_info()
+                        tuner_type = tuner_info.get('tuner_type', 'Unknown')
+
+                        # Check if this is an E4000 tuner
+                        if tuner_type == '1' or 'E4000' in str(tuner_type):
+                            return [TextContent(
+                                type="text",
+                                text="❌ ADS-B tracking not available with E4000 tuner.\n\n"
+                                     "ADS-B operates at 1090 MHz, which falls in the E4000's "
+                                     "L-band gap (1084-1239 MHz). The E4000 tuner cannot lock "
+                                     "to frequencies in this range due to hardware limitations.\n\n"
+                                     "Alternative options:\n"
+                                     "• Use an RTL-SDR with R820T/R820T2 tuner (supports 24-1766 MHz continuously)\n"
+                                     "• Try other aviation frequencies outside the gap:\n"
+                                     "  - VHF Air Band: 118-137 MHz (voice)\n"
+                                     "  - UAT (978 MHz) - also in gap, won't work\n\n"
+                                     "Your E4000 works great for: FM radio, amateur radio, "
+                                     "weather satellites, and most other SDR applications."
+                            )]
+
                     # Configure for ADS-B
-                    await self.sdr.set_frequency(ADSB_FREQUENCY)
-                    await self.sdr.set_sample_rate(ADSB_SAMPLE_RATE)
-                    await self.sdr.set_gain('auto')
-                    
+                    try:
+                        await self.sdr.set_frequency(ADSB_FREQUENCY)
+                        await self.sdr.set_sample_rate(ADSB_SAMPLE_RATE)
+                        await self.sdr.set_gain('auto')
+                    except Exception as e:
+                        return [TextContent(
+                            type="text",
+                            text=f"Failed to configure SDR for ADS-B: {str(e)}\n\n"
+                                 "This may be due to tuner limitations. "
+                                 "Check that your SDR supports 1090 MHz."
+                        )]
+
                     # Start ADS-B decoder task
                     self.active_decoders["adsb"] = asyncio.create_task(self._adsb_decoder_task())
-                    
+
                     return [TextContent(type="text", text="Started ADS-B aircraft tracking on 1090 MHz")]
                     
                 elif name == "aviation_stop_tracking":

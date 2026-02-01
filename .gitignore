@@ -38,14 +38,23 @@ Thumbs.db
 config.local.json
 *.log
 
-# Temporary test scripts (not part of main codebase)
-test_hardware.py
-test_hardware_simple.py
-test_mcp_tools.py
-test_mcp_server.py
-test_server_components.py
-test_mcp_stdio.py
-verify_sdr.py
-
 # Setup documentation (user-specific)
 SETUP_CLAUDE_DESKTOP.md
+VERIFICATION.md
+
+# Temporary test scripts
+tests/servertest.py
+tests/test_adsb_frequency.py
+tests/test_hardware.py
+tests/test_hardware_simple.py
+tests/test_mcp_server.py
+tests/test_mcp_stdio.py
+tests/test_mcp_tools.py
+tests/test_server_components.py
+tests/verify_sdr.py
+
+# Temporary/local test outputs
+tests/*.csv
+tests/*.json
+tests/output/
+tests/__pycache__/
