@@ -72,61 +72,62 @@ class ADSBDecoder:
         self.aircraft: Dict[str, Aircraft] = {}
         self.message_count = 0
         
-    def decode_message(self, msg: bytes) -> Optional[Dict[str, Any]]:
-        """Decode a single ADS-B message"""
+    def decode_message(self, msg_hex: str) -> Optional[Dict[str, Any]]:
+        """Decode a single ADS-B message from hex string"""
         if not ADSB_AVAILABLE:
             return None
-            
+
         try:
-            if len(msg) != 14:  # Standard ADS-B message length
+            # pyModeS expects hex strings, not bytes
+            if len(msg_hex) != 28:  # 14 bytes * 2 hex chars
                 return None
-                
+
             # Get ICAO address
-            icao = pms.icao(msg)
+            icao = pms.adsb.icao(msg_hex)
             if not icao:
                 return None
-                
+
             # Update or create aircraft entry
             if icao not in self.aircraft:
                 self.aircraft[icao] = Aircraft(icao=icao, last_seen=datetime.now())
-                
+
             aircraft = self.aircraft[icao]
             aircraft.last_seen = datetime.now()
             aircraft.message_count += 1
             self.message_count += 1
-            
+
             # Decode message type
-            tc = pms.typecode(msg)
-            
+            tc = pms.adsb.typecode(msg_hex)
+
             # Aircraft identification (callsign)
             if 1 <= tc <= 4:
-                callsign = pms.adsb.callsign(msg)
+                callsign = pms.adsb.callsign(msg_hex)
                 if callsign:
                     aircraft.callsign = callsign.strip()
-                    
+
             # Airborne position
             elif tc in [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22]:
-                alt = pms.adsb.altitude(msg)
+                alt = pms.adsb.altitude(msg_hex)
                 if alt:
                     aircraft.altitude = alt
-                    
+
             # Airborne velocity
             elif tc == 19:
-                velocity = pms.adsb.velocity(msg)
+                velocity = pms.adsb.velocity(msg_hex)
                 if velocity:
                     speed, heading, _, _ = velocity
                     if speed:
                         aircraft.speed = speed
                     if heading:
                         aircraft.heading = heading
-                        
+
             return {
                 "icao": icao,
                 "aircraft": asdict(aircraft),
                 "message_type": tc,
-                "raw": msg.hex()
+                "raw": msg_hex
             }
-            
+
         except Exception as e:
             logger.debug(f"Failed to decode ADS-B message: {e}")
             return None
@@ -450,51 +451,21 @@ class SDRMCPServer:
                     return [TextContent(type="text", text=json.dumps(asdict(status), indent=2))]
                     
                 elif name == "aviation_track_aircraft":
-                    if not self.sdr:
-                        return [TextContent(type="text", text="No SDR connected")]
-
                     if "adsb" in self.active_decoders:
                         return [TextContent(type="text", text="ADS-B tracking already active")]
 
-                    # Check if frequency is in E4000 gap
-                    if 1084e6 <= ADSB_FREQUENCY <= 1239e6:
-                        tuner_info = await self.sdr.get_info()
-                        tuner_type = tuner_info.get('tuner_type', 'Unknown')
-
-                        # Check if this is an E4000 tuner
-                        if tuner_type == '1' or 'E4000' in str(tuner_type):
-                            return [TextContent(
-                                type="text",
-                                text="❌ ADS-B tracking not available with E4000 tuner.\n\n"
-                                     "ADS-B operates at 1090 MHz, which falls in the E4000's "
-                                     "L-band gap (1084-1239 MHz). The E4000 tuner cannot lock "
-                                     "to frequencies in this range due to hardware limitations.\n\n"
-                                     "Alternative options:\n"
-                                     "• Use an RTL-SDR with R820T/R820T2 tuner (supports 24-1766 MHz continuously)\n"
-                                     "• Try other aviation frequencies outside the gap:\n"
-                                     "  - VHF Air Band: 118-137 MHz (voice)\n"
-                                     "  - UAT (978 MHz) - also in gap, won't work\n\n"
-                                     "Your E4000 works great for: FM radio, amateur radio, "
-                                     "weather satellites, and most other SDR applications."
-                            )]
-
-                    # Configure for ADS-B
+                    # Start ADS-B decoder task (rtl_adsb handles the SDR directly)
                     try:
-                        await self.sdr.set_frequency(ADSB_FREQUENCY)
-                        await self.sdr.set_sample_rate(ADSB_SAMPLE_RATE)
-                        await self.sdr.set_gain('auto')
+                        self.active_decoders["adsb"] = asyncio.create_task(self._adsb_decoder_task())
+                        # Give it a moment to start
+                        await asyncio.sleep(0.5)
+                        return [TextContent(type="text", text="Started ADS-B aircraft tracking on 1090 MHz using rtl_adsb")]
                     except Exception as e:
                         return [TextContent(
                             type="text",
-                            text=f"Failed to configure SDR for ADS-B: {str(e)}\n\n"
-                                 "This may be due to tuner limitations. "
-                                 "Check that your SDR supports 1090 MHz."
+                            text=f"Failed to start ADS-B tracking: {str(e)}\n\n"
+                                 "Make sure rtl_adsb is installed and your RTL-SDR is connected."
                         )]
-
-                    # Start ADS-B decoder task
-                    self.active_decoders["adsb"] = asyncio.create_task(self._adsb_decoder_task())
-
-                    return [TextContent(type="text", text="Started ADS-B aircraft tracking on 1090 MHz")]
                     
                 elif name == "aviation_stop_tracking":
                     if "adsb" in self.active_decoders:
@@ -780,22 +751,59 @@ class SDRMCPServer:
                 return f"Unknown resource: {uri}"
                 
     async def _adsb_decoder_task(self):
-        """Background task for ADS-B decoding"""
-        logger.info("Starting ADS-B decoder task")
+        """Background task for ADS-B decoding using rtl_adsb"""
+        logger.info("Starting ADS-B decoder task with rtl_adsb")
         self.sdr.is_capturing = True
-        
+
         try:
+            # Start rtl_adsb as a subprocess
+            process = await asyncio.create_subprocess_exec(
+                'rtl_adsb',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+
+            logger.info(f"Started rtl_adsb process (PID: {process.pid})")
+
             while True:
-                # This is a simplified decoder - real implementation would need
-                # proper ADS-B frame detection and error checking
-                samples = await self.sdr.read_samples(int(ADSB_SAMPLE_RATE * 0.1))  # 100ms chunks
-                
-                # Here you would implement actual ADS-B demodulation
-                # For now, this is a placeholder
-                await asyncio.sleep(0.1)
-                
+                # Read line from rtl_adsb output
+                line = await process.stdout.readline()
+                if not line:
+                    break
+
+                try:
+                    # Decode the line
+                    msg_line = line.decode('utf-8').strip()
+
+                    # Skip non-message lines
+                    if not msg_line.startswith('*') or not msg_line.endswith(';'):
+                        continue
+
+                    # Remove * and ; delimiters to get hex string
+                    msg_hex = msg_line[1:-1]
+
+                    # Decode the message (pyModeS expects hex string)
+                    if len(msg_hex) == 28:  # 14 bytes * 2 hex chars
+                        decoded = self.adsb_decoder.decode_message(msg_hex)
+                        if decoded:
+                            logger.debug(f"Decoded ADS-B message from {decoded['icao']}")
+
+                except Exception as e:
+                    logger.debug(f"Failed to decode line: {e}")
+                    continue
+
         except asyncio.CancelledError:
             logger.info("ADS-B decoder task cancelled")
+            if process:
+                process.terminate()
+                await process.wait()
+            self.sdr.is_capturing = False
+            raise
+        except Exception as e:
+            logger.error(f"ADS-B decoder task error: {e}")
+            if process:
+                process.terminate()
+                await process.wait()
             self.sdr.is_capturing = False
             raise
             

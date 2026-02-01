@@ -43,6 +43,7 @@ SETUP_CLAUDE_DESKTOP.md
 VERIFICATION.md
 
 # Temporary test scripts
+tests/*
 tests/servertest.py
 tests/test_adsb_frequency.py
 tests/test_hardware.py
