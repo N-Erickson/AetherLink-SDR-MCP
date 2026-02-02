@@ -4,7 +4,6 @@ Control Software Defined Radios and decode radio protocols through an AI-friendl
 
 ## 🚀 Features
 
-- **Direct Hardware Control**: RTL-SDR and HackRF One
 - **Protocol Decoders**: ADS-B aircraft tracking, POCSAG pagers, AIS ship tracking, NOAA weather satellites
 - **Advanced Analysis**: Real-time spectrum analysis, waterfall displays, signal detection, frequency scanning
 - **Audio Recording**: Demodulate and record FM/AM audio as WAV files
@@ -116,20 +115,18 @@ You should see: "Successfully connected to RTL-SDR"
 |-----------|-------------------|------------|-------------|--------|
 | RTL-SDR   | 24 MHz - 1766 MHz | ❌         | ✅ Stable   | ✅ Yes |
 | HackRF One| 1 MHz - 6 GHz     | ✅         | ✅ Working  | ⚠️ Limited |
+| Nooelec E4000| 55 MHz - 2300 MHz | ❌      | ✅ Stable   | ✅ Yes |
 
-**Tested RTL-SDR:**
-- Rafael Micro R820T tuner
-- 24-1766 MHz continuous coverage
-- No L-band gap (unlike E4000 tuner)
+
 
 ## 📊 Protocol Support
 
-| Protocol    | Description          | Status      | Real-World Tested |
-|-------------|---------------------|-------------|-------------------|
-| **ADS-B**   | Aircraft tracking   | ✅ **WORKING** | ✅ 244 msgs/20s, 104 aircraft |
-| **POCSAG**  | Pager decoding      | ✅ Ready    | ⏰ Needs patience |
-| **AIS**     | Ship tracking       | ✅ Ready    | ❌ No ships nearby |
-| **NOAA APT**| Weather satellites  | ✅ Ready    | ⏰ Needs satellite pass |
+| Protocol    | Description          | Status      |
+|-------------|---------------------|-------------|
+| **ADS-B**   | Aircraft tracking   | ✅ Ready    |
+| **POCSAG**  | Pager decoding      | ✅ Ready    |
+| **AIS**     | Ship tracking       | ✅ Ready    |
+| **NOAA APT**| Weather satellites  | ✅ Ready    |
 
 ### Protocol Details
 
@@ -237,12 +234,6 @@ Stop audio recording
 ```
 Files saved to: `/tmp/sdr_recordings/audio_YYYYMMDD_HHMMSS_XXXMHz_FM.wav`
 
-**Features:**
-- FM demodulation with 75μs de-emphasis (US standard)
-- AM demodulation with envelope detection
-- 48 kHz WAV output (playable with any audio player)
-- Automatic normalization to prevent clipping
-
 ### Record Raw IQ Samples
 ```
 Set frequency to 103.7 MHz
@@ -259,64 +250,6 @@ Files saved to: `/tmp/sdr_recordings/recording_YYYYMMDD_HHMMSS_XXXMHz.iq`
 ### NOAA Satellite (when overhead)
 ```
 Decode NOAA-19 satellite for 600 seconds
-```
-
-## 🧪 Testing
-
-### CI Tests (Automated)
-
-[![Sanity Checks](https://github.com/yourusername/AetherLink-SDR-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/AetherLink-SDR-MCP/actions/workflows/ci.yml)
-
-**What CI tests:**
-- ✅ Code imports without errors
-- ✅ Server initializes properly
-- ✅ DSP algorithms (FM/AM demod, AGC, resampling)
-- ✅ Decoders instantiate correctly
-
-**What CI does NOT test:**
-- ❌ Real SDR hardware (no USB on runners)
-- ❌ RF signal reception (no antennas in data centers)
-- ❌ Actual decoder performance
-
-Run CI tests locally:
-```bash
-pytest tests/test_sanity.py -v
-```
-
-### Manual Tests (Requires Hardware)
-
-Located in `tests/manual/` - **cannot run in CI**
-
-**ADS-B:**
-- `test_complete_adsb.py` - Full end-to-end test ✅ WORKING
-
-**Audio Recording:**
-- `test_audio_recording.py` - Basic functionality
-- `test_smooth_audio.py` - Quality verification
-
-**POCSAG Pagers:**
-- `test_live_pocsag.py` - Live pager decoding
-- `monitor_pagers.sh` - Long-term monitor (run for hours)
-
-**NOAA Satellites:**
-- `test_real_noaa.py` - Real satellite pass decoding
-
-**General:**
-- `test_all_functions.py` - All core SDR functions
-
-### Running Manual Tests
-
-```bash
-# Requires RTL-SDR/HackRF hardware connected
-cd tests/manual
-
-# ADS-B test (needs aircraft overhead)
-python test_complete_adsb.py
-
-# Audio quality test (needs FM station)
-python test_smooth_audio.py
-
-# See tests/manual/README.md for full details
 ```
 
 ## 🔧 Development
@@ -353,31 +286,3 @@ AetherLink-SDR-MCP/
 - POCSAG: `rtl_fm` + `multimon-ng` pipeline
 - AIS: Built-in GMSK demodulator (simplified)
 - NOAA: Built-in AM demodulator + sync detection
-
-## 🐛 Known Issues
-
-1. **USB Device Conflict**: Only one process can access RTL-SDR at a time
-   - Solution: Stop other processes before connecting
-
-2. **"PLL not locked" Warning**: Harmless warning from RTL-SDR library
-   - Solution: Ignore, doesn't affect functionality
-
-3. **POCSAG Messages Intermittent**: Pagers only transmit when someone gets paged
-   - Solution: Run long-term monitor (hours/days)
-
-4. **NOAA Requires Satellite Overhead**: Only works during passes
-   - Solution: Check n2yo.com for pass times
-
-## 📚 Documentation
-
-- [tests/manual/README.md](tests/manual/README.md) - Manual testing guide
-- See tests/ directory for validation examples
-
-## 🤝 Contributing
-
-This project is in active development. Current status:
-- ✅ ADS-B fully working and tested
-- ✅ POCSAG decoder integrated (multimon-ng)
-- ✅ Audio recording with FM/AM demodulation
-- ✅ All 23 MCP tools implemented
-- ⏰ Protocol decoders ready, waiting for signals
