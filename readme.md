@@ -86,7 +86,8 @@ The following are installed automatically:
 - `numpy` - Signal processing
 - `scipy` - Filtering and demodulation
 - `mcp` - Model Context Protocol server
-- `pyModeS` - ADS-B decoding
+- `Pillow` - Image processing for NOAA satellite images
+- `pyModeS` - ADS-B decoding (optional)
 
 ## 🎯 Quick Start
 
