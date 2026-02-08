@@ -788,9 +788,9 @@ class SDRMCPServer:
                     image = self.noaa_decoder.decode_pass(all_samples, int(self.sdr.sample_rate), satellite)
 
                     if image:
-                        # Save image
+                        # Save image to /tmp/sdr_recordings (same as other recording tools)
                         import os
-                        output_dir = "recordings"
+                        output_dir = "/tmp/sdr_recordings"
                         os.makedirs(output_dir, exist_ok=True)
                         filename = f"{output_dir}/noaa_{satellite}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                         self.noaa_decoder.save_image(image, filename)
