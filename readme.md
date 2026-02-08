@@ -4,12 +4,13 @@ Control Software Defined Radios and decode radio protocols through an AI-friendl
 
 ## 🚀 Features
 
-- **Protocol Decoders**: ADS-B aircraft tracking, POCSAG pagers, AIS ship tracking, NOAA weather satellites, ISM band devices
+- **Protocol Decoders**: ADS-B aircraft tracking, POCSAG pagers, AIS ship tracking, Meteor-M LRPT satellites, ISM band devices
+- **Weather Satellites**: Meteor-M2-3/M2-4 LRPT decoding with SatDump (NOAA APT deprecated - decommissioned Aug 2025)
 - **Advanced Analysis**: Real-time spectrum analysis, waterfall displays, signal detection, frequency scanning
 - **Audio Recording**: Demodulate and record FM/AM audio as WAV files
 - **ISM Band Scanning**: Decode 433MHz/315MHz devices (weather stations, sensors, doorbells, tire pressure monitors)
 - **MCP Integration**: Seamless integration with Claude Desktop and other MCP clients
-- **26 MCP Tools**: Complete SDR control through natural language
+- **27 MCP Tools**: Complete SDR control through natural language
 
 ## 📦 Installation
 
@@ -38,7 +39,26 @@ sudo apt-get install rtl-sdr
 # Includes: rtl_fm, rtl_adsb, rtl_test
 ```
 
-**3. rtl_433 for ISM band decoding (optional but recommended):**
+**3. SatDump for Meteor-M LRPT decoding (required for weather satellites):**
+```bash
+# macOS
+brew install satdump
+
+# Fix SatDump resource paths (required on macOS - the cask doesn't set these up correctly)
+sudo mkdir -p /usr/local/share/satdump
+sudo ln -sf /Applications/SatDump.app/Contents/Resources/* /usr/local/share/satdump/
+sudo mkdir -p /usr/local/lib/satdump
+sudo ln -sf /Applications/SatDump.app/Contents/Resources/plugins /usr/local/lib/satdump/plugins
+
+# Ubuntu/Debian
+sudo add-apt-repository ppa:satdump/satdump
+sudo apt-get update
+sudo apt-get install satdump
+
+# Enables Meteor-M2-3/M2-4 LRPT weather satellite decoding
+```
+
+**4. rtl_433 for ISM band decoding (optional but recommended):**
 ```bash
 # macOS
 brew install rtl_433
@@ -49,7 +69,7 @@ sudo apt-get install rtl-433
 # Enables decoding of 433MHz/315MHz devices
 ```
 
-**4. POCSAG Decoder (optional):**
+**5. POCSAG Decoder (optional):**
 ```bash
 # Clone and build multimon-ng
 cd /tmp
@@ -139,7 +159,8 @@ You should see: "Successfully connected to RTL-SDR"
 | **ADS-B**   | Aircraft tracking   | ✅ Ready    |
 | **POCSAG**  | Pager decoding      | ✅ Ready    |
 | **AIS**     | Ship tracking       | ✅ Ready    |
-| **NOAA APT**| Weather satellites  | ✅ Ready    |
+| **Meteor-M LRPT**| Weather satellites (M2-3, M2-4) | ✅ Ready |
+| **NOAA APT**| Weather satellites (DEPRECATED) | ⚠️ EOL Aug 2025 |
 | **ISM Band**| 433MHz/315MHz devices | ✅ Ready  |
 
 ### Protocol Details
@@ -161,10 +182,18 @@ You should see: "Successfully connected to RTL-SDR"
 - Decodes ship position, speed, type
 - Requires coastal location
 
-**NOAA APT (137 MHz):**
-- AM demodulation
-- Decodes weather satellite images
-- Requires satellite overhead (2 passes/day)
+**Meteor-M LRPT (137 MHz):**
+- Uses `satdump` subprocess for OQPSK demodulation
+- Digital LRPT transmission with error correction
+- Decodes visible and infrared channels
+- Active satellites: Meteor-M2-3 (137.9 MHz), Meteor-M2-4 (137.9 MHz primary, 137.1 MHz backup)
+- **CURRENT WEATHER SATELLITE STANDARD** (replaced NOAA APT)
+
+**NOAA APT (137 MHz) - DEPRECATED:**
+- AM demodulation (analog)
+- All NOAA APT satellites decommissioned August 2025
+- Tool remains for historical/testing purposes
+- ⚠️ Use Meteor-M LRPT for current weather satellite imaging
 
 **ISM Band (433/315/868/915 MHz):**
 - Uses `rtl_433` subprocess for decoding
@@ -173,7 +202,7 @@ You should see: "Successfully connected to RTL-SDR"
 - Weather stations, sensors, doorbells, tire pressure monitors, remote controls
 - Common frequencies: 433.92 MHz (EU/Asia), 315 MHz (NA), 868 MHz (EU), 915 MHz (NA)
 
-## 🛠️ Available MCP Tools (26 Total)
+## 🛠️ Available MCP Tools (27 Total)
 
 ### Core SDR Control (5 tools)
 - `sdr_connect` - Connect to RTL-SDR or HackRF
@@ -197,8 +226,9 @@ You should see: "Successfully connected to RTL-SDR"
 - `marine_stop_tracking` - Stop tracking
 - `marine_get_vessels` - Get vessel list
 
-### Satellite (1 tool)
-- `satellite_decode_noaa` - Decode NOAA weather satellite pass
+### Weather Satellites (2 tools)
+- `satellite_decode_meteor` - Decode Meteor-M2-3/M2-4 LRPT satellite pass (CURRENT)
+- `satellite_decode_noaa` - Decode NOAA APT satellite pass (DEPRECATED - satellites decommissioned)
 
 ### ISM Band Devices (3 tools)
 - `ism_start_scanning` - Start scanning ISM bands (433/315/868/915 MHz) with multi-frequency hopping
@@ -273,10 +303,33 @@ Files saved to: `/tmp/sdr_recordings/recording_YYYYMMDD_HHMMSS_XXXMHz.iq`
 
 **Use case:** Advanced analysis, replay, or processing with GNU Radio/SDR#
 
-### NOAA Satellite (when overhead)
+### Meteor-M Weather Satellite (when overhead)
+```
+Decode Meteor-M2-4 satellite for 600 seconds
+```
+
+**Requirements:**
+- SatDump installed (`brew install satdump`)
+- Satellite pass overhead (use tools like Gpredict, N2YO, or Heavens-Above to predict passes)
+- Ideally a V-dipole antenna tuned for 137 MHz
+
+**What you get:**
+- Visible light channel images
+- Infrared channel images
+- Composite RGB images
+- Saved to `/tmp/sdr_recordings/meteor_METEOR-M2-4_*/`
+
+**Tips:**
+- Meteor-M2-4 transmits on 137.9 MHz (primary) or 137.1 MHz (backup)
+- Best results with satellite elevation >30°
+- Full pass is typically 10-15 minutes
+- Use higher gain (40-49 dB) for weak signals
+
+### NOAA Satellite - DEPRECATED
 ```
 Decode NOAA-19 satellite for 600 seconds
 ```
+⚠️ **Note:** All NOAA APT satellites were decommissioned in August 2025. This tool remains for historical purposes only. Use `satellite_decode_meteor` for current weather satellite imaging.
 
 ### Scan ISM Band Devices
 ```

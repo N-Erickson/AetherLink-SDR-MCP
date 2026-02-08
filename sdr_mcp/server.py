@@ -36,6 +36,7 @@ from .decoders.pocsag import POCSAGDecoder
 from .decoders.ais import AISDecoder
 from .decoders.noaa_apt import NOAAAPTDecoder
 from .decoders.rtl433 import RTL433Decoder
+from .decoders.meteor_lrpt import MeteorLRPTDecoder
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -161,6 +162,7 @@ class SDRMCPServer:
         self.ais_decoder = AISDecoder()
         self.noaa_decoder = NOAAAPTDecoder()
         self.rtl433_decoder = RTL433Decoder()
+        self.meteor_decoder = MeteorLRPTDecoder()
         self.active_decoders: Dict[str, asyncio.Task] = {}
 
         # Analysis modules
@@ -304,7 +306,7 @@ class SDRMCPServer:
                 ),
                 Tool(
                     name="satellite_decode_noaa",
-                    description="Decode NOAA weather satellite APT transmission from recorded IQ samples",
+                    description="Decode NOAA weather satellite APT transmission (DEPRECATED - all NOAA APT satellites decommissioned Aug 2025)",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -320,6 +322,31 @@ class SDRMCPServer:
                             }
                         },
                         "required": ["satellite"]
+                    }
+                ),
+                Tool(
+                    name="satellite_decode_meteor",
+                    description="Decode Meteor-M weather satellite LRPT transmission using SatDump",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "satellite": {
+                                "type": "string",
+                                "enum": ["METEOR-M2-3", "METEOR-M2-4"],
+                                "description": "Meteor satellite identifier",
+                                "default": "METEOR-M2-4"
+                            },
+                            "duration": {
+                                "type": "number",
+                                "description": "Recording duration in seconds (typically 600-900 for full pass)",
+                                "default": 600
+                            },
+                            "gain": {
+                                "type": "number",
+                                "description": "RTL-SDR gain in dB",
+                                "default": 40
+                            }
+                        }
                     }
                 ),
                 Tool(
@@ -801,6 +828,105 @@ class SDRMCPServer:
                         result += f"Saved to: {filename}\n"
                     else:
                         result += "❌ Failed to decode image - no valid sync patterns found\n"
+
+                    return [TextContent(type="text", text=result)]
+
+                elif name == "satellite_decode_meteor":
+                    satellite = arguments.get("satellite", "METEOR-M2-4")
+                    duration = arguments.get("duration", 600)
+                    gain = arguments.get("gain", 40)
+
+                    # Get satellite info
+                    sat_info = self.meteor_decoder.get_satellite_info(satellite)
+                    if not sat_info:
+                        return [TextContent(type="text", text=f"Unknown satellite: {satellite}")]
+
+                    if sat_info["status"] != "active":
+                        return [TextContent(type="text", text=f"Warning: {satellite} status is '{sat_info['status']}'. Decoding may fail.\n\nActive satellites: {', '.join(self.meteor_decoder.get_active_satellites())}")]
+
+                    freq = sat_info["frequency"]
+
+                    # Check for SatDump
+                    import shutil
+                    satdump_path = shutil.which('satdump')
+                    if not satdump_path:
+                        return [TextContent(type="text", text="SatDump not found! Install with: brew install satdump\n\nSatDump is required for Meteor-M LRPT decoding.")]
+
+                    result = f"Decoding {satellite} LRPT transmission...\n"
+                    result += f"Frequency: {freq/1e6:.3f} MHz\n"
+                    result += f"Duration: {duration} seconds\n"
+                    result += f"Gain: {gain} dB\n\n"
+
+                    # Create output directory
+                    import os
+                    output_dir = f"/tmp/sdr_recordings/meteor_{satellite}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    os.makedirs(output_dir, exist_ok=True)
+
+                    # Build SatDump command
+                    cmd = self.meteor_decoder.build_satdump_command(
+                        satellite, freq, output_dir, duration, gain
+                    )
+
+                    result += f"Running: {' '.join(cmd)}\n\n"
+                    result += "This will take several minutes. SatDump will:\n"
+                    result += "1. Tune RTL-SDR to " + f"{freq/1e6:.1f} MHz\n"
+                    result += "2. Demodulate OQPSK signal\n"
+                    result += "3. Decode LRPT frames with error correction\n"
+                    result += "4. Generate channel images (visible, infrared)\n"
+                    result += f"5. Save results to: {output_dir}/\n\n"
+
+                    # Run SatDump
+                    try:
+                        logger.info(f"Starting SatDump for {satellite}")
+                        process = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+
+                        # Wait for completion
+                        stdout, stderr = await process.communicate()
+
+                        if process.returncode == 0:
+                            # Parse output
+                            parsed = self.meteor_decoder.parse_satdump_output(output_dir)
+
+                            if parsed["success"] and parsed["images"]:
+                                result += f"✅ Successfully decoded {satellite}!\n\n"
+                                result += f"Images generated: {len(parsed['images'])}\n"
+                                result += f"Output directory: {output_dir}/\n\n"
+
+                                result += "Decoded files:\n"
+                                for img in parsed["images"]:
+                                    result += f"  - {os.path.basename(img)}\n"
+
+                                # Create pass record
+                                from .decoders.meteor_lrpt import MeteorPass
+                                meteor_pass = MeteorPass(
+                                    satellite=satellite,
+                                    frequency=freq,
+                                    start_time=datetime.now(),
+                                    duration=duration,
+                                    output_dir=output_dir,
+                                    decoded_images=parsed["images"],
+                                    success=True,
+                                    channels_received=parsed["channels"]
+                                )
+                                self.meteor_decoder.add_pass(meteor_pass)
+
+                            else:
+                                result += "❌ Decoding completed but no images were generated.\n"
+                                result += "This usually means:\n"
+                                result += "- Satellite was below horizon (check pass prediction)\n"
+                                result += "- Signal too weak (check antenna and gain)\n"
+                                result += "- Incorrect frequency\n"
+                        else:
+                            result += f"❌ SatDump failed with return code {process.returncode}\n"
+                            if stderr:
+                                result += f"\nError: {stderr.decode()[:500]}\n"
+
+                    except Exception as e:
+                        result += f"❌ Error running SatDump: {str(e)}\n"
 
                     return [TextContent(type="text", text=result)]
 
