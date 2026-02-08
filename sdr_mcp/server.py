@@ -35,6 +35,7 @@ except ImportError:
 from .decoders.pocsag import POCSAGDecoder
 from .decoders.ais import AISDecoder
 from .decoders.noaa_apt import NOAAAPTDecoder
+from .decoders.rtl433 import RTL433Decoder
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -159,6 +160,7 @@ class SDRMCPServer:
         self.pocsag_decoder = POCSAGDecoder()
         self.ais_decoder = AISDecoder()
         self.noaa_decoder = NOAAAPTDecoder()
+        self.rtl433_decoder = RTL433Decoder()
         self.active_decoders: Dict[str, asyncio.Task] = {}
 
         # Analysis modules
@@ -465,6 +467,45 @@ class SDRMCPServer:
                             }
                         },
                         "required": ["frequency", "signal_type"]
+                    }
+                ),
+                Tool(
+                    name="ism_start_scanning",
+                    description="Start scanning ISM bands for devices (433MHz, 315MHz, 868MHz, 915MHz) using rtl_433",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "frequencies": {
+                                "type": "array",
+                                "description": "List of frequencies to scan in MHz (e.g., [433.92, 315])",
+                                "items": {"type": "number"},
+                                "default": [433.92, 315]
+                            },
+                            "hop_interval": {
+                                "type": "integer",
+                                "description": "Hop between frequencies every N seconds",
+                                "default": 30
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="ism_stop_scanning",
+                    description="Stop ISM band scanning",
+                    inputSchema={"type": "object", "properties": {}}
+                ),
+                Tool(
+                    name="ism_get_devices",
+                    description="Get list of detected ISM band devices (weather stations, sensors, etc.)",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "max_age": {
+                                "type": "integer",
+                                "description": "Maximum age of devices in seconds",
+                                "default": 300
+                            }
+                        }
                     }
                 )
             ]
@@ -973,9 +1014,84 @@ class SDRMCPServer:
                     
                     await asyncio.sleep(duration)
                     
-                    return [TextContent(type="text", 
+                    return [TextContent(type="text",
                         text=f"Transmitted {signal_type} signal at {frequency/1e6:.3f} MHz for {duration} seconds")]
-                    
+
+                elif name == "ism_start_scanning":
+                    if "rtl433" in self.active_decoders:
+                        return [TextContent(type="text", text="ISM scanning already active")]
+
+                    # Get frequencies and hop interval
+                    freq_mhz_list = arguments.get("frequencies", [433.92, 315])
+                    hop_interval = arguments.get("hop_interval", 30)
+
+                    # Convert MHz to Hz
+                    frequencies = [f * 1e6 for f in freq_mhz_list]
+
+                    # Update decoder settings
+                    self.rtl433_decoder.set_frequencies(frequencies)
+                    self.rtl433_decoder.set_hop_interval(hop_interval)
+
+                    # Start decoder task
+                    try:
+                        self.active_decoders["rtl433"] = asyncio.create_task(self._rtl433_decoder_task())
+                        await asyncio.sleep(2.0)  # Give it time to start
+
+                        # Check if it failed immediately
+                        if self.active_decoders["rtl433"].done():
+                            try:
+                                await self.active_decoders["rtl433"]
+                            except Exception as e:
+                                del self.active_decoders["rtl433"]
+                                return [TextContent(type="text", text=f"Failed to start rtl_433: {str(e)}\n\nMake sure rtl_433 is installed and RTL-SDR is connected.")]
+
+                        freq_str = ", ".join([f"{f:.2f} MHz" for f in freq_mhz_list])
+                        return [TextContent(type="text", text=f"Started ISM band scanning with rtl_433\n\nFrequencies: {freq_str}\nHop interval: {hop_interval} seconds\n\nNOTE: Python SDR control is paused while scanning.\nUse ism_stop_scanning to regain SDR control.")]
+                    except Exception as e:
+                        return [TextContent(type="text", text=f"Failed to start ISM scanning: {str(e)}")]
+
+                elif name == "ism_stop_scanning":
+                    if "rtl433" in self.active_decoders:
+                        self.active_decoders["rtl433"].cancel()
+                        del self.active_decoders["rtl433"]
+                        return [TextContent(type="text", text="Stopped ISM scanning")]
+                    else:
+                        return [TextContent(type="text", text="ISM scanning not active")]
+
+                elif name == "ism_get_devices":
+                    max_age = arguments.get("max_age", 300)
+                    devices = self.rtl433_decoder.get_device_list(max_age_seconds=max_age)
+                    stats = self.rtl433_decoder.get_statistics()
+
+                    result = f"ISM Band Devices Detected\n"
+                    result += f"=" * 50 + "\n\n"
+                    result += f"Total messages: {stats['total_messages']}\n"
+                    result += f"Unique devices: {stats['total_devices_seen']}\n"
+                    result += f"Active devices: {stats['active_devices']}\n"
+                    result += f"Scanning: {', '.join([f'{f:.2f} MHz' for f in stats['frequencies_MHz']])}\n"
+                    result += f"Hop interval: {stats['hop_interval_seconds']}s\n\n"
+
+                    if stats['device_types']:
+                        result += "Device types seen:\n"
+                        for device_type, count in stats['device_types'].items():
+                            result += f"  • {device_type}: {count}\n"
+                        result += "\n"
+
+                    if not devices:
+                        result += "No devices detected in the last " + str(max_age) + " seconds.\n"
+                        result += "\nTips:\n"
+                        result += "- Make sure devices are transmitting\n"
+                        result += "- Weather stations typically transmit every 30-60 seconds\n"
+                        result += "- Try waiting longer for more results\n"
+                    else:
+                        result += f"Recently Active Devices ({len(devices)}):\n"
+                        result += "-" * 50 + "\n\n"
+                        for device in devices:
+                            result += self.rtl433_decoder.get_device_summary(device) + "\n"
+                            result += f"  Last seen: {device['age_seconds']}s ago\n\n"
+
+                    return [TextContent(type="text", text=result)]
+
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
                     
@@ -1290,6 +1406,129 @@ class SDRMCPServer:
         except asyncio.CancelledError:
             logger.info("Audio recording task cancelled")
             raise
+
+    async def _rtl433_decoder_task(self):
+        """Background task for rtl_433 ISM band decoding using rtl_433 subprocess
+
+        NOTE: This temporarily disconnects Python SDR control and gives
+        exclusive access to rtl_433. Other SDR functions won't work while this runs.
+        Stop scanning to regain SDR control.
+        """
+        logger.info("Starting rtl_433 decoder with subprocess")
+
+        # Disconnect Python SDR to free the device
+        python_sdr_was_connected = self.sdr is not None
+        if self.sdr:
+            logger.info("Releasing SDR device for rtl_433")
+            await self.sdr.disconnect()
+            self.sdr = None
+
+            # Force garbage collection and wait for USB release
+            import gc
+            gc.collect()
+            await asyncio.sleep(0.5)  # Give OS time to release USB device
+            logger.info("USB device released")
+
+        process = None
+        try:
+            # Find rtl_433 binary
+            import shutil
+            import os
+            rtl_433_path = shutil.which('rtl_433') or '/opt/homebrew/bin/rtl_433'
+
+            if not rtl_433_path or not os.path.exists(rtl_433_path):
+                logger.error(f"rtl_433 not found! Checked: {rtl_433_path}")
+                raise FileNotFoundError(f"rtl_433 not found at {rtl_433_path}")
+
+            logger.info(f"Found rtl_433 at: {rtl_433_path}")
+
+            # Build command with frequency hopping
+            cmd = [rtl_433_path, "-F", "json"]
+
+            # Add frequencies
+            for freq in self.rtl433_decoder.frequencies:
+                cmd.extend(["-f", f"{int(freq)}"])
+
+            # Add hop interval if multiple frequencies
+            if len(self.rtl433_decoder.frequencies) > 1:
+                cmd.extend(["-H", str(self.rtl433_decoder.hop_interval)])
+
+            logger.info(f"Starting rtl_433 with command: {' '.join(cmd)}")
+
+            # Start rtl_433 subprocess
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            logger.info(f"rtl_433 started (PID: {process.pid})")
+
+            # Monitor stderr for errors in background
+            async def check_stderr():
+                try:
+                    while True:
+                        line = await process.stderr.readline()
+                        if not line:
+                            break
+                        decoded = line.decode().strip()
+                        if decoded:
+                            logger.info(f"rtl_433: {decoded}")
+                            if 'error' in decoded.lower() or 'failed' in decoded.lower():
+                                logger.error(f"rtl_433 ERROR: {decoded}")
+                except Exception as e:
+                    logger.debug(f"stderr monitoring ended: {e}")
+
+            # Start stderr monitoring
+            asyncio.create_task(check_stderr())
+
+            msg_count = 0
+            last_log_time = asyncio.get_event_loop().time()
+
+            # Read and decode JSON messages
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    logger.error("rtl_433 output ended")
+                    break
+
+                json_line = line.decode().strip()
+                if json_line:
+                    device = self.rtl433_decoder.parse_message(json_line)
+                    if device:
+                        msg_count += 1
+                        logger.debug(f"Decoded {device.model}: {self.rtl433_decoder.get_device_summary(device)}")
+
+                # Log every 30 seconds
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_log_time > 30:
+                    stats = self.rtl433_decoder.get_statistics()
+                    logger.info(f"RTL_433: {msg_count} msgs, {stats['total_devices_seen']} devices, {stats['active_devices']} active")
+                    last_log_time = current_time
+
+        except asyncio.CancelledError:
+            logger.info("RTL_433 scanning stopped by user")
+            raise
+        except Exception as e:
+            import traceback
+            logger.error(f"RTL_433 decoder error: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+        finally:
+            # Cleanup
+            if process:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2.0)
+                except:
+                    process.kill()
+
+            # Reconnect Python SDR if it was connected before
+            if python_sdr_was_connected:
+                logger.info("Reconnecting Python SDR control")
+                from .hardware.rtlsdr import RTLSDRDevice
+                self.sdr = RTLSDRDevice()
+                await self.sdr.connect()
 
     async def run(self):
         """Run the MCP server"""

@@ -4,11 +4,12 @@ Control Software Defined Radios and decode radio protocols through an AI-friendl
 
 ## 🚀 Features
 
-- **Protocol Decoders**: ADS-B aircraft tracking, POCSAG pagers, AIS ship tracking, NOAA weather satellites
+- **Protocol Decoders**: ADS-B aircraft tracking, POCSAG pagers, AIS ship tracking, NOAA weather satellites, ISM band devices
 - **Advanced Analysis**: Real-time spectrum analysis, waterfall displays, signal detection, frequency scanning
 - **Audio Recording**: Demodulate and record FM/AM audio as WAV files
+- **ISM Band Scanning**: Decode 433MHz/315MHz devices (weather stations, sensors, doorbells, tire pressure monitors)
 - **MCP Integration**: Seamless integration with Claude Desktop and other MCP clients
-- **23 MCP Tools**: Complete SDR control through natural language
+- **26 MCP Tools**: Complete SDR control through natural language
 
 ## 📦 Installation
 
@@ -37,7 +38,18 @@ sudo apt-get install rtl-sdr
 # Includes: rtl_fm, rtl_adsb, rtl_test
 ```
 
-**3. POCSAG Decoder (optional but recommended):**
+**3. rtl_433 for ISM band decoding (optional but recommended):**
+```bash
+# macOS
+brew install rtl_433
+
+# Ubuntu/Debian
+sudo apt-get install rtl-433
+
+# Enables decoding of 433MHz/315MHz devices
+```
+
+**4. POCSAG Decoder (optional):**
 ```bash
 # Clone and build multimon-ng
 cd /tmp
@@ -50,7 +62,7 @@ make
 # Binary will be at: /tmp/multimon-ng/build/multimon-ng
 ```
 
-**4. Python 3.10+**
+**5. Python 3.10+**
 
 ### Install from Source
 
@@ -127,6 +139,7 @@ You should see: "Successfully connected to RTL-SDR"
 | **POCSAG**  | Pager decoding      | ✅ Ready    |
 | **AIS**     | Ship tracking       | ✅ Ready    |
 | **NOAA APT**| Weather satellites  | ✅ Ready    |
+| **ISM Band**| 433MHz/315MHz devices | ✅ Ready  |
 
 ### Protocol Details
 
@@ -152,7 +165,14 @@ You should see: "Successfully connected to RTL-SDR"
 - Decodes weather satellite images
 - Requires satellite overhead (2 passes/day)
 
-## 🛠️ Available MCP Tools (23 Total)
+**ISM Band (433/315/868/915 MHz):**
+- Uses `rtl_433` subprocess for decoding
+- Multi-frequency hopping support
+- Decodes 200+ device types automatically
+- Weather stations, sensors, doorbells, tire pressure monitors, remote controls
+- Common frequencies: 433.92 MHz (EU/Asia), 315 MHz (NA), 868 MHz (EU), 915 MHz (NA)
+
+## 🛠️ Available MCP Tools (26 Total)
 
 ### Core SDR Control (5 tools)
 - `sdr_connect` - Connect to RTL-SDR or HackRF
@@ -178,6 +198,11 @@ You should see: "Successfully connected to RTL-SDR"
 
 ### Satellite (1 tool)
 - `satellite_decode_noaa` - Decode NOAA weather satellite pass
+
+### ISM Band Devices (3 tools)
+- `ism_start_scanning` - Start scanning ISM bands (433/315/868/915 MHz) with multi-frequency hopping
+- `ism_stop_scanning` - Stop ISM band scanning
+- `ism_get_devices` - Get detected devices (weather stations, sensors, etc.)
 
 ### Analysis (5 tools)
 - `spectrum_analyze` - Analyze RF spectrum (FFT, signal detection)
@@ -252,6 +277,30 @@ Files saved to: `/tmp/sdr_recordings/recording_YYYYMMDD_HHMMSS_XXXMHz.iq`
 Decode NOAA-19 satellite for 600 seconds
 ```
 
+### Scan ISM Band Devices
+```
+Start ISM scanning on 433.92 MHz and 315 MHz with 30 second hop interval
+```
+Wait 1-2 minutes for devices to transmit, then:
+```
+Show me the ISM devices
+```
+
+**Common devices detected:**
+- Weather stations (temperature, humidity, wind, rain)
+- Wireless thermometers
+- Tire pressure monitoring systems (TPMS)
+- Door/window sensors
+- Doorbells and remote controls
+- Soil moisture sensors
+
+**Tips:**
+- Weather stations typically transmit every 30-60 seconds
+- 433.92 MHz is common in Europe/Asia
+- 315 MHz is common in North America
+- Try different frequency combinations: `[433.92, 315]` or `[868, 915]`
+- Increase hop interval for more dwell time per frequency
+
 ## 🔧 Development
 
 ### Project Structure
@@ -259,14 +308,15 @@ Decode NOAA-19 satellite for 600 seconds
 ```
 AetherLink-SDR-MCP/
 ├── sdr_mcp/
-│   ├── server.py              # Main MCP server (21 tools)
+│   ├── server.py              # Main MCP server (26 tools)
 │   ├── hardware/
 │   │   ├── rtlsdr.py         # RTL-SDR interface
 │   │   └── hackrf.py         # HackRF interface
 │   ├── decoders/
 │   │   ├── pocsag.py         # POCSAG pager decoder
 │   │   ├── ais.py            # AIS ship decoder
-│   │   └── noaa_apt.py       # NOAA satellite decoder
+│   │   ├── noaa_apt.py       # NOAA satellite decoder
+│   │   └── rtl433.py         # ISM band device decoder
 │   └── analysis/
 │       └── spectrum.py        # Spectrum analysis, signal detection
 ├── tests/                     # All test scripts
@@ -276,13 +326,14 @@ AetherLink-SDR-MCP/
 ### Architecture
 
 **Device Management:**
-- RTL-SDR and ADS-B use **exclusive device access**
-- Python SDR control and rtl_adsb cannot run simultaneously
-- `aviation_track_aircraft` automatically disconnects Python SDR
-- `aviation_stop_tracking` reconnects Python SDR
+- RTL-SDR and subprocess decoders use **exclusive device access**
+- Python SDR control and subprocess tools (rtl_adsb, rtl_433) cannot run simultaneously
+- Subprocess-based decoders automatically disconnect Python SDR
+- Stopping decoder reconnects Python SDR control
 
 **Decoders:**
 - ADS-B: `rtl_adsb` subprocess + pyModeS
+- ISM Band: `rtl_433` subprocess with JSON output + multi-frequency hopping
 - POCSAG: `rtl_fm` + `multimon-ng` pipeline
 - AIS: Built-in GMSK demodulator (simplified)
 - NOAA: Built-in AM demodulator + sync detection
