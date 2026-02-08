@@ -878,14 +878,23 @@ class SDRMCPServer:
                     # Run SatDump
                     try:
                         logger.info(f"Starting SatDump for {satellite}")
+                        logger.info(f"Command: {' '.join(cmd)}")
+
                         process = await asyncio.create_subprocess_exec(
                             *cmd,
                             stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
+                            stderr=asyncio.subprocess.STDOUT  # Combine stderr with stdout
                         )
 
-                        # Wait for completion
-                        stdout, stderr = await process.communicate()
+                        # Wait for completion and capture output
+                        stdout, _ = await process.communicate()
+
+                        # Decode output
+                        output_text = stdout.decode('utf-8', errors='replace') if stdout else ""
+
+                        logger.info(f"SatDump return code: {process.returncode}")
+                        if output_text:
+                            logger.info(f"SatDump output (last 500 chars): {output_text[-500:]}")
 
                         if process.returncode == 0:
                             # Parse output
@@ -922,11 +931,14 @@ class SDRMCPServer:
                                 result += "- Incorrect frequency\n"
                         else:
                             result += f"❌ SatDump failed with return code {process.returncode}\n"
-                            if stderr:
-                                result += f"\nError: {stderr.decode()[:500]}\n"
+                            if output_text:
+                                # Show last part of output which usually contains the error
+                                result += f"\nOutput (last 1000 chars):\n{output_text[-1000:]}\n"
 
                     except Exception as e:
                         result += f"❌ Error running SatDump: {str(e)}\n"
+                        import traceback
+                        result += f"\nTraceback:\n{traceback.format_exc()}\n"
 
                     return [TextContent(type="text", text=result)]
 

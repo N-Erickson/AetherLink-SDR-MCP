@@ -45,8 +45,12 @@ sudo apt-get install rtl-sdr
 brew install satdump
 
 # Fix SatDump resource paths (required on macOS - the cask doesn't set these up correctly)
+# Step 1: Symlink all resources to /usr/local/share/satdump/
 sudo mkdir -p /usr/local/share/satdump
-sudo ln -sf /Applications/SatDump.app/Contents/Resources/* /usr/local/share/satdump/
+cd /Applications/SatDump.app/Contents/Resources
+sudo cp -R * /usr/local/share/satdump/
+
+# Step 2: Symlink plugins directory to /usr/local/lib/satdump/
 sudo mkdir -p /usr/local/lib/satdump
 sudo ln -sf /Applications/SatDump.app/Contents/Resources/plugins /usr/local/lib/satdump/plugins
 
