@@ -77,6 +77,10 @@ class AISDecoder:
 
     def decode_position_report(self, mmsi: str, payload: bytes) -> Optional[Dict[str, Any]]:
         """Decode AIS position report (message types 1, 2, 3)"""
+        if len(payload) < 17:
+            logger.debug(f"AIS position report payload too short: {len(payload)} bytes")
+            return None
+
         # Extract fields from payload
         # This is a simplified decoder - real AIS needs proper bit extraction
 
@@ -109,6 +113,10 @@ class AISDecoder:
 
     def decode_static_data(self, mmsi: str, payload: bytes) -> Optional[Dict[str, Any]]:
         """Decode AIS static and voyage data (message type 5)"""
+        if len(payload) < 423:
+            logger.debug(f"AIS static data payload too short: {len(payload)} bytes")
+            return None
+
         # Extract vessel name (20 chars, 6-bit ASCII)
         name_data = payload[20:140].decode('ascii', errors='ignore')
         name = self.decode_sixbit(name_data) if name_data else None
@@ -134,13 +142,13 @@ class AISDecoder:
 
     def decode_message(self, payload: bytes) -> Optional[Dict[str, Any]]:
         """Decode AIS message"""
-        if len(payload) < 2:
+        if len(payload) < 6:
             return None
 
         # Message type (6 bits)
         msg_type = (payload[0] >> 2) & 0x3F
 
-        # MMSI (30 bits)
+        # MMSI (30 bits) - requires 6 bytes for extraction
         mmsi_raw = ((payload[1] & 0x3) << 28) | (payload[2] << 20) | (payload[3] << 12) | (payload[4] << 4) | ((payload[5] >> 4) & 0xF)
         mmsi = str(mmsi_raw)
 

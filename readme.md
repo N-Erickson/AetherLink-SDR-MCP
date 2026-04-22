@@ -2,17 +2,17 @@
 
 Control Software Defined Radios and decode radio protocols through an AI-friendly Model Context Protocol interface.
 
-## 🚀 Features
+## Features
 
 - **Protocol Decoders**: ADS-B aircraft tracking, POCSAG pagers, AIS ship tracking, Meteor-M LRPT satellites, ISM band devices
-- **Weather Satellites**: Meteor-M2-3/M2-4 LRPT decoding with SatDump (NOAA APT deprecated - decommissioned Aug 2025)
+- **Weather Satellites**: Meteor-M2-3/M2-4 LRPT decoding with SatDump
 - **Advanced Analysis**: Real-time spectrum analysis, waterfall displays, signal detection, frequency scanning
 - **Audio Recording**: Demodulate and record FM/AM audio as WAV files
 - **ISM Band Scanning**: Decode 433MHz/315MHz devices (weather stations, sensors, doorbells, tire pressure monitors)
 - **MCP Integration**: Seamless integration with Claude Desktop and other MCP clients
-- **27 MCP Tools**: Complete SDR control through natural language
+- **26 MCP Tools**: Complete SDR control through natural language
 
-## 📦 Installation
+## Installation
 
 ### Prerequisites
 
@@ -92,7 +92,7 @@ make
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/AetherLink-SDR-MCP
+git clone https://github.com/N-Erickson/AetherLink-SDR-MCP
 cd AetherLink-SDR-MCP
 
 # Create virtual environment
@@ -110,10 +110,9 @@ The following are installed automatically:
 - `numpy` - Signal processing
 - `scipy` - Filtering and demodulation
 - `mcp` - Model Context Protocol server
-- `Pillow` - Image processing for NOAA satellite images
 - `pyModeS` - ADS-B decoding (optional)
 
-## 🎯 Quick Start
+## Quick Start
 
 ### 1. Configure Claude Desktop
 
@@ -122,20 +121,20 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 ```json
 {
   "mcpServers": {
-    "sdr": {
-      "command": "/Users/YOUR_USERNAME/Documents/GitHub/AetherLink-SDR-MCP/venv/bin/python",
+    "aetherlink": {
+      "command": "/path/to/AetherLink-SDR-MCP/venv/bin/python",
       "args": ["-m", "sdr_mcp.server"],
-      "env": {}
+      "cwd": "/path/to/AetherLink-SDR-MCP"
     }
   }
 }
 ```
 
-**Important:** Use absolute paths for the Python interpreter.
+**Important:** Replace `/path/to/` with your actual path. Run `which python` with your venv activated to find the correct Python path.
 
 ### 2. Restart Claude Desktop
 
-Quit and restart Claude Desktop to load the MCP server.
+Quit completely (Cmd+Q) and restart Claude Desktop to load the MCP server.
 
 ### 3. Test the Connection
 
@@ -146,7 +145,14 @@ Connect to my RTL-SDR
 
 You should see: "Successfully connected to RTL-SDR"
 
-## 📡 Supported Hardware
+### Troubleshooting
+
+- **Server not appearing:** Check logs at `~/Library/Logs/Claude/mcp-server-aetherlink.log`
+- **"Device busy" errors:** Only one program can use the SDR at a time. Close GQRX, SDR#, or other SDR software.
+- **Linux device permissions:** Add udev rules for RTL-SDR (`/etc/udev/rules.d/20-rtlsdr.rules`) and blacklist the `dvb_usb_rtl28xxu` kernel module.
+- **E4000 tuner gap:** Frequencies 1084-1239 MHz may not work on E4000-based dongles. This is normal hardware behavior.
+
+## Supported Hardware
 
 | Device    | RX Frequency      | TX Support | Status      | Tested |
 |-----------|-------------------|------------|-------------|--------|
@@ -156,7 +162,7 @@ You should see: "Successfully connected to RTL-SDR"
 
 
 
-## 📊 Protocol Support
+## Protocol Support
 
 | Protocol    | Description          | Status      |
 |-------------|---------------------|-------------|
@@ -164,7 +170,6 @@ You should see: "Successfully connected to RTL-SDR"
 | **POCSAG**  | Pager decoding      | ✅ Ready    |
 | **AIS**     | Ship tracking       | ✅ Ready    |
 | **Meteor-M LRPT**| Weather satellites (M2-3, M2-4) | ✅ Ready |
-| **NOAA APT**| Weather satellites (DEPRECATED) | ⚠️ EOL Aug 2025 |
 | **ISM Band**| 433MHz/315MHz devices | ✅ Ready  |
 
 ### Protocol Details
@@ -193,12 +198,6 @@ You should see: "Successfully connected to RTL-SDR"
 - Active satellites: Meteor-M2-3 (137.9 MHz), Meteor-M2-4 (137.9 MHz primary, 137.1 MHz backup)
 - **CURRENT WEATHER SATELLITE STANDARD** (replaced NOAA APT)
 
-**NOAA APT (137 MHz) - DEPRECATED:**
-- AM demodulation (analog)
-- All NOAA APT satellites decommissioned August 2025
-- Tool remains for historical/testing purposes
-- ⚠️ Use Meteor-M LRPT for current weather satellite imaging
-
 **ISM Band (433/315/868/915 MHz):**
 - Uses `rtl_433` subprocess for decoding
 - Multi-frequency hopping support
@@ -206,7 +205,7 @@ You should see: "Successfully connected to RTL-SDR"
 - Weather stations, sensors, doorbells, tire pressure monitors, remote controls
 - Common frequencies: 433.92 MHz (EU/Asia), 315 MHz (NA), 868 MHz (EU), 915 MHz (NA)
 
-## 🛠️ Available MCP Tools (27 Total)
+## Available MCP Tools (26 Total)
 
 ### Core SDR Control (5 tools)
 - `sdr_connect` - Connect to RTL-SDR or HackRF
@@ -230,9 +229,8 @@ You should see: "Successfully connected to RTL-SDR"
 - `marine_stop_tracking` - Stop tracking
 - `marine_get_vessels` - Get vessel list
 
-### Weather Satellites (2 tools)
-- `satellite_decode_meteor` - Decode Meteor-M2-3/M2-4 LRPT satellite pass (CURRENT)
-- `satellite_decode_noaa` - Decode NOAA APT satellite pass (DEPRECATED - satellites decommissioned)
+### Weather Satellites (1 tool)
+- `satellite_decode_meteor` - Decode Meteor-M2-3/M2-4 LRPT satellite pass
 
 ### ISM Band Devices (3 tools)
 - `ism_start_scanning` - Start scanning ISM bands (433/315/868/915 MHz) with multi-frequency hopping
@@ -249,7 +247,7 @@ You should see: "Successfully connected to RTL-SDR"
 - `hackrf_set_tx_gain` - Set transmit gain
 - `signal_generator` - Generate and transmit signals
 
-## 📖 Usage Examples
+## Usage Examples
 
 ### Track Aircraft
 ```
@@ -329,12 +327,6 @@ Decode Meteor-M2-4 satellite for 600 seconds
 - Full pass is typically 10-15 minutes
 - Use higher gain (40-49 dB) for weak signals
 
-### NOAA Satellite - DEPRECATED
-```
-Decode NOAA-19 satellite for 600 seconds
-```
-⚠️ **Note:** All NOAA APT satellites were decommissioned in August 2025. This tool remains for historical purposes only. Use `satellite_decode_meteor` for current weather satellite imaging.
-
 ### Scan ISM Band Devices
 ```
 Start ISM scanning on 433.92 MHz and 315 MHz with 30 second hop interval
@@ -359,7 +351,7 @@ Show me the ISM devices
 - Try different frequency combinations: `[433.92, 315]` or `[868, 915]`
 - Increase hop interval for more dwell time per frequency
 
-## 🔧 Development
+## Development
 
 ### Project Structure
 
@@ -367,18 +359,23 @@ Show me the ISM devices
 AetherLink-SDR-MCP/
 ├── sdr_mcp/
 │   ├── server.py              # Main MCP server (26 tools)
+│   ├── __main__.py            # python -m sdr_mcp entry point
 │   ├── hardware/
+│   │   ├── base.py            # Abstract SDR device base class
 │   │   ├── rtlsdr.py         # RTL-SDR interface
 │   │   └── hackrf.py         # HackRF interface
 │   ├── decoders/
 │   │   ├── pocsag.py         # POCSAG pager decoder
 │   │   ├── ais.py            # AIS ship decoder
-│   │   ├── noaa_apt.py       # NOAA satellite decoder
-│   │   └── rtl433.py         # ISM band device decoder
-│   └── analysis/
-│       └── spectrum.py        # Spectrum analysis, signal detection
+│   │   ├── rtl433.py         # ISM band device decoder
+│   │   └── meteor_lrpt.py    # Meteor-M LRPT satellite decoder
+│   ├── analysis/
+│   │   └── spectrum.py        # Spectrum analysis, signal detection
+│   └── utils/
+│       └── validators.py      # Input validation and safety checks
 ├── tests/                     # All test scripts
-└── README.md                  # This file
+├── pyproject.toml             # Package configuration
+└── readme.md                  # This file
 ```
 
 ### Architecture
@@ -394,4 +391,3 @@ AetherLink-SDR-MCP/
 - ISM Band: `rtl_433` subprocess with JSON output + multi-frequency hopping
 - POCSAG: `rtl_fm` + `multimon-ng` pipeline
 - AIS: Built-in GMSK demodulator (simplified)
-- NOAA: Built-in AM demodulator + sync detection
