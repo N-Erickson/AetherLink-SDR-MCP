@@ -2,9 +2,6 @@
 # Run: powershell -ExecutionPolicy Bypass -File install.ps1
 
 $ErrorActionPreference = "Stop"
-
-$RepoUrl = "https://github.com/N-Erickson/AetherLink-SDR-MCP"
-$InstallDir = if ($env:AETHERLINK_DIR) { $env:AETHERLINK_DIR } else { "$env:USERPROFILE\AetherLink-SDR-MCP" }
 $PythonMin = "3.10"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -16,38 +13,12 @@ function Write-Fail  { Write-Host "[ERROR] " -ForegroundColor Red -NoNewline; Wr
 
 function Prompt-YesNo {
     param([string]$Message)
-    $answer = Read-Host "$Message [Y/n]"
+    $answer = Read-Host "  $Message [Y/n]"
     if ([string]::IsNullOrEmpty($answer)) { $answer = "Y" }
     return $answer -match "^[Yy]"
 }
 
-# ─── Check Python ─────────────────────────────────────────────────────────────
-
-function Check-Python {
-    $python = $null
-    foreach ($candidate in @("python", "python3", "py")) {
-        try {
-            $ver = & $candidate -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
-            if ($ver) {
-                $parts = $ver.Split(".")
-                if ([int]$parts[0] -ge 3 -and [int]$parts[1] -ge 10) {
-                    $python = $candidate
-                    break
-                }
-            }
-        } catch { }
-    }
-
-    if (-not $python) {
-        Write-Fail "Python >= $PythonMin not found. Download from https://www.python.org/downloads/"
-    }
-
-    $script:Python = $python
-    $version = & $python --version 2>&1
-    Write-Ok "Python: $version"
-}
-
-# ─── Check Git ────────────────────────────────────────────────────────────────
+# ─── Check prerequisites ─────────────────────────────────────────────────────
 
 function Check-Git {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -56,7 +27,30 @@ function Check-Git {
     Write-Ok "Git found"
 }
 
-# ─── System dependencies info ─────────────────────────────────────────────────
+function Check-Python {
+    $script:Python = $null
+    foreach ($candidate in @("python", "python3", "py")) {
+        try {
+            $ver = & $candidate -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+            if ($ver) {
+                $parts = $ver.Split(".")
+                if ([int]$parts[0] -ge 3 -and [int]$parts[1] -ge 10) {
+                    $script:Python = $candidate
+                    break
+                }
+            }
+        } catch { }
+    }
+
+    if (-not $script:Python) {
+        Write-Fail "Python >= $PythonMin not found. Download from https://www.python.org/downloads/"
+    }
+
+    $version = & $script:Python --version 2>&1
+    Write-Ok "Python: $version"
+}
+
+# ─── System dependencies ─────────────────────────────────────────────────────
 
 function Install-SystemDeps {
     Write-Info "Checking system dependencies..."
@@ -67,130 +61,191 @@ function Install-SystemDeps {
         Write-Ok "RTL-SDR drivers found"
     } else {
         Write-Warn "RTL-SDR drivers not found"
-        Write-Host "  Download from: https://osmocom.org/projects/rtl-sdr/wiki"
-        Write-Host "  Or use: winget install osmocom.rtl-sdr (if available)"
-        Write-Host "  After installing, add the bin directory to your PATH"
         Write-Host ""
+        Write-Host "  RTL-SDR requires two things on Windows:" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  1. RTL-SDR binaries:"
+        Write-Host "     Download from: https://ftp.osmocom.org/binaries/windows/rtl-sdr/"
+        Write-Host "     Extract and add the folder to your system PATH"
+        Write-Host ""
+        Write-Host "  2. Zadig USB driver (REQUIRED):"
+        Write-Host "     Download from: https://zadig.akeo.ie/"
+        Write-Host "     - Run as Administrator"
+        Write-Host "     - Options -> List All Devices"
+        Write-Host "     - Select 'Bulk-In, Interface (Interface 0)'"
+        Write-Host "     - Set driver to 'WinUSB'"
+        Write-Host "     - Click 'Replace Driver'"
+        Write-Host ""
+        Write-Host "  If driver install fails, disable Memory Integrity:" -ForegroundColor Yellow
+        Write-Host "     Settings -> Privacy & security -> Windows Security ->"
+        Write-Host "     Device security -> Core isolation -> Memory integrity OFF"
+        Write-Host ""
+
+        if (Prompt-YesNo "Open RTL-SDR download page in browser?") {
+            Start-Process "https://ftp.osmocom.org/binaries/windows/rtl-sdr/"
+        }
+        if (Prompt-YesNo "Open Zadig download page in browser?") {
+            Start-Process "https://zadig.akeo.ie/"
+        }
     }
 
     # rtl_433
     if (Get-Command rtl_433 -ErrorAction SilentlyContinue) {
         Write-Ok "rtl_433 found"
     } else {
-        Write-Warn "rtl_433 not found (optional - needed for ISM band scanning)"
-        Write-Host "  Download from: https://github.com/merbanan/rtl_433/releases"
-        Write-Host ""
+        if (Prompt-YesNo "Open rtl_433 download page? (ISM band device decoding)") {
+            Start-Process "https://github.com/merbanan/rtl_433/releases"
+        } else {
+            Write-Warn "Skipped rtl_433 (optional)"
+        }
     }
 
     # SatDump
     if (Get-Command satdump -ErrorAction SilentlyContinue) {
         Write-Ok "SatDump found"
     } else {
-        Write-Warn "SatDump not found (optional - needed for satellite decoding)"
-        Write-Host "  Download from: https://github.com/SatDump/SatDump/releases"
-        Write-Host ""
-    }
-
-    # Check for Zadig (USB driver)
-    Write-Host ""
-    Write-Info "IMPORTANT: Windows requires Zadig to replace the RTL-SDR USB driver."
-    Write-Host "  1. Download Zadig from https://zadig.akeo.ie/"
-    Write-Host "  2. Plug in your RTL-SDR"
-    Write-Host "  3. In Zadig: Options > List All Devices"
-    Write-Host "  4. Select 'Bulk-In, Interface (Interface 0)'"
-    Write-Host "  5. Set driver to 'WinUSB' and click 'Replace Driver'"
-    Write-Host ""
-}
-
-# ─── Clone or update repo ────────────────────────────────────────────────────
-
-function Setup-Repo {
-    if (Test-Path "$InstallDir\.git") {
-        Write-Info "Repository exists at $InstallDir, pulling latest..."
-        try {
-            git -C $InstallDir pull --ff-only 2>$null
-        } catch {
-            Write-Warn "Could not pull latest (you may have local changes)"
+        if (Prompt-YesNo "Open SatDump download page? (satellite image decoding)") {
+            Start-Process "https://github.com/SatDump/SatDump/releases"
+        } else {
+            Write-Warn "Skipped SatDump (optional)"
         }
-    } else {
-        Write-Info "Cloning repository to $InstallDir..."
-        git clone $RepoUrl $InstallDir
     }
-    Write-Ok "Repository ready at $InstallDir"
+
+    Write-Host ""
 }
 
-# ─── Set up Python environment ────────────────────────────────────────────────
+# ─── Install AetherLink ──────────────────────────────────────────────────────
 
-function Setup-PythonEnv {
-    Set-Location $InstallDir
+function Install-AetherLink {
+    Write-Info "Installing AetherLink..."
 
-    if (-not (Test-Path "venv")) {
-        Write-Info "Creating virtual environment..."
-        & $script:Python -m venv venv
+    $script:AetherlinkCmd = ""
+
+    # Check for uv
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        & uv tool install aetherlink 2>&1 | Select-Object -Last 3
+        $script:AetherlinkCmd = "uvx aetherlink"
+        Write-Ok "AetherLink installed via uv"
     }
+    # Check for pipx
+    elseif (Get-Command pipx -ErrorAction SilentlyContinue) {
+        try {
+            & pipx install aetherlink 2>&1 | Select-Object -Last 3
+        } catch {
+            & pipx upgrade aetherlink 2>&1 | Select-Object -Last 3
+        }
+        $aetherlinkPath = (Get-Command aetherlink -ErrorAction SilentlyContinue).Source
+        $script:AetherlinkCmd = if ($aetherlinkPath) { $aetherlinkPath } else { "pipx run aetherlink" }
+        Write-Ok "AetherLink installed via pipx"
+    }
+    # Fallback: create venv
+    else {
+        $venvDir = "$env:USERPROFILE\.aetherlink"
 
-    Write-Info "Installing Python dependencies..."
-    & venv\Scripts\pip install --upgrade pip -q 2>$null
-    & venv\Scripts\pip install -e . -q 2>$null
-    Write-Ok "Python environment ready"
+        if (Test-Path "$venvDir\Scripts\python.exe") {
+            Write-Info "Upgrading existing install at $venvDir..."
+            & "$venvDir\Scripts\pip" install --upgrade aetherlink -q 2>&1 | Select-Object -Last 3
+        } else {
+            Write-Info "Creating isolated environment at $venvDir..."
+            & $script:Python -m venv $venvDir
+            & "$venvDir\Scripts\pip" install --upgrade pip -q 2>&1 | Select-Object -Last 1
+            & "$venvDir\Scripts\pip" install aetherlink -q 2>&1 | Select-Object -Last 3
+        }
+        $script:AetherlinkCmd = "$venvDir\Scripts\aetherlink.exe"
+        Write-Ok "AetherLink installed in $venvDir"
+    }
 
     # Verify
-    & venv\Scripts\python -c "from sdr_mcp.server import SDRMCPServer; print('AetherLink imports OK')" 2>$null
-    Write-Ok "AetherLink verified"
+    try {
+        $ver = & $script:AetherlinkCmd --version 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok $ver
+        } else {
+            throw "non-zero exit"
+        }
+    } catch {
+        # Fallback verify via Python import
+        $testPython = "$env:USERPROFILE\.aetherlink\Scripts\python.exe"
+        if (Test-Path $testPython) {
+            try {
+                $ver = & $testPython -c "from sdr_mcp import __version__; print(f'aetherlink {__version__}')" 2>&1
+                Write-Ok $ver
+            } catch {
+                Write-Warn "Package installed but verification failed -- try running 'aetherlink --version' manually"
+            }
+        } else {
+            Write-Warn "Package installed but verification failed"
+        }
+    }
 }
 
-# ─── Generate Claude Desktop config ──────────────────────────────────────────
+# ─── Configure Claude Desktop ────────────────────────────────────────────────
 
 function Setup-ClaudeDesktop {
+    Write-Host ""
+    Write-Info "Configuring Claude Desktop..."
+
     $configDir = "$env:APPDATA\Claude"
     $configFile = "$configDir\claude_desktop_config.json"
-    $pythonPath = "$InstallDir\venv\Scripts\python.exe"
-    # Escape backslashes for JSON
-    $pythonPathJson = $pythonPath.Replace("\", "\\")
-    $installDirJson = $InstallDir.Replace("\", "\\")
 
-    Write-Host ""
-    Write-Info "Claude Desktop MCP configuration:"
+    # Try --setup first
+    try {
+        & $script:AetherlinkCmd --setup 2>&1
+        if ($LASTEXITCODE -eq 0) { return }
+    } catch { }
 
-    $snippet = @"
-{
-  "mcpServers": {
-    "aetherlink": {
-      "command": "$pythonPathJson",
-      "args": ["-m", "sdr_mcp.server"],
-      "cwd": "$installDirJson"
-    }
-  }
-}
-"@
+    # Manual fallback
+    $cmdJson = $script:AetherlinkCmd.Replace("\", "\\")
 
+    # Load or create config
+    $config = @{ mcpServers = @{} }
     if (Test-Path $configFile) {
-        $content = Get-Content $configFile -Raw
-        if ($content -match "aetherlink") {
-            Write-Ok "Claude Desktop already configured for AetherLink"
+        try {
+            $existing = Get-Content $configFile -Raw | ConvertFrom-Json
+            # Preserve existing config
+            $config = @{}
+            $existing.PSObject.Properties | ForEach-Object { $config[$_.Name] = $_.Value }
+            if (-not $config.ContainsKey("mcpServers")) {
+                $config["mcpServers"] = @{}
+            }
+        } catch {
+            Write-Warn "Could not parse existing config, creating backup..."
+            Copy-Item $configFile "$configFile.bak" -Force
+        }
+    }
+
+    # Check existing
+    $mcpServers = $config["mcpServers"]
+    if ($mcpServers -is [PSCustomObject]) {
+        $hash = @{}
+        $mcpServers.PSObject.Properties | ForEach-Object { $hash[$_.Name] = $_.Value }
+        $mcpServers = $hash
+        $config["mcpServers"] = $hash
+    }
+
+    if ($mcpServers.ContainsKey("aetherlink")) {
+        Write-Host "  AetherLink already configured"
+        if (-not (Prompt-YesNo "Update AetherLink entry? (other servers untouched)")) {
+            Write-Host "  No changes made."
             return
         }
-
-        Write-Warn "Existing config found at $configFile"
-        Write-Host "  Add this to your mcpServers section:"
-        Write-Host ""
-        Write-Host "    `"aetherlink`": {" -ForegroundColor Yellow
-        Write-Host "      `"command`": `"$pythonPathJson`"," -ForegroundColor Yellow
-        Write-Host "      `"args`": [`"-m`", `"sdr_mcp.server`"]," -ForegroundColor Yellow
-        Write-Host "      `"cwd`": `"$installDirJson`"" -ForegroundColor Yellow
-        Write-Host "    }" -ForegroundColor Yellow
-    } else {
-        if (Prompt-YesNo "  Create Claude Desktop config automatically?") {
-            New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-            $snippet | Out-File -Encoding utf8 $configFile
-            Write-Ok "Config written to $configFile"
-        } else {
-            Write-Host ""
-            Write-Host "  Add this to $configFile`:"
-            Write-Host ""
-            Write-Host $snippet
-        }
     }
+
+    $otherServers = $mcpServers.Keys | Where-Object { $_ -ne "aetherlink" }
+    if ($otherServers) {
+        Write-Host "  Existing MCP servers (untouched): $($otherServers -join ', ')"
+    }
+
+    $mcpServers["aetherlink"] = @{
+        command = $script:AetherlinkCmd
+        args = @()
+    }
+
+    # Write config
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    $config | ConvertTo-Json -Depth 10 | Out-File -Encoding utf8 $configFile
+    Write-Ok "Added AetherLink to $configFile"
+    Write-Host "  Restart Claude Desktop to activate."
 }
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
@@ -201,22 +256,21 @@ function Print-Summary {
     Write-Host "  AetherLink SDR MCP - Installation Complete" -ForegroundColor Green
     Write-Host "========================================================" -ForegroundColor Green
     Write-Host ""
-    Write-Host "  Install location: $InstallDir"
-    Write-Host "  Python:           $InstallDir\venv\Scripts\python.exe"
-    Write-Host ""
     Write-Host "  System tools:"
 
-    foreach ($tool in @(
+    $tools = @(
         @("rtl_test",    "RTL-SDR drivers"),
         @("rtl_adsb",    "ADS-B decoder"),
         @("rtl_433",     "ISM band decoder"),
         @("satdump",     "Satellite decoder"),
         @("multimon-ng", "POCSAG decoder")
-    )) {
+    )
+
+    foreach ($tool in $tools) {
         if (Get-Command $tool[0] -ErrorAction SilentlyContinue) {
             Write-Host "    " -NoNewline; Write-Host "+" -ForegroundColor Green -NoNewline; Write-Host " $($tool[1]) ($($tool[0]))"
         } else {
-            Write-Host "    " -NoNewline; Write-Host "x" -ForegroundColor Yellow -NoNewline; Write-Host " $($tool[1]) ($($tool[0])) - not installed"
+            Write-Host "    " -NoNewline; Write-Host "-" -ForegroundColor Yellow -NoNewline; Write-Host " $($tool[1]) ($($tool[0])) - not installed"
         }
     }
 
@@ -239,7 +293,6 @@ Write-Host ""
 Check-Git
 Check-Python
 Install-SystemDeps
-Setup-Repo
-Setup-PythonEnv
+Install-AetherLink
 Setup-ClaudeDesktop
 Print-Summary

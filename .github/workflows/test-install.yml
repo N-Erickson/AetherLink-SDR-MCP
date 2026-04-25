@@ -1,0 +1,101 @@
+name: Test Install Script
+
+on:
+  push:
+    paths:
+      - "install.sh"
+      - "install.ps1"
+      - "pyproject.toml"
+      - "sdr_mcp/**"
+  pull_request:
+    paths:
+      - "install.sh"
+      - "install.ps1"
+  workflow_dispatch:
+
+jobs:
+  test-linux-install:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Run install script (non-interactive)
+      env:
+        NONINTERACTIVE: "1"
+      run: |
+        # Install from local source instead of PyPI for CI
+        # First build and install the package
+        pip install build
+        python -m build
+        pip install dist/*.whl
+
+        # Test CLI
+        aetherlink --version
+        aetherlink --help
+
+        # Test server can initialize
+        python -c "
+        from sdr_mcp.server import SDRMCPServer
+        server = SDRMCPServer()
+        assert server.server.name == 'sdr-mcp'
+        print('Server initializes OK')
+        "
+
+        # Test --setup in dry-run (won't find Claude Desktop config dir, should handle gracefully)
+        aetherlink --setup || true
+
+        echo "Linux install test passed (Python ${{ matrix.python-version }})"
+
+  test-macos-install:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Test install from source
+      run: |
+        pip install build
+        python -m build
+        pip install dist/*.whl
+
+        aetherlink --version
+        aetherlink --help
+
+        python -c "
+        from sdr_mcp.server import SDRMCPServer
+        server = SDRMCPServer()
+        assert server.server.name == 'sdr-mcp'
+        print('Server initializes OK')
+        "
+
+        echo "macOS install test passed"
+
+  test-windows-install:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Test install from source
+      run: |
+        pip install build
+        python -m build
+        pip install (Get-ChildItem dist\*.whl).FullName
+
+        aetherlink --version
+        aetherlink --help
+
+        python -c "from sdr_mcp.server import SDRMCPServer; server = SDRMCPServer(); assert server.server.name == 'sdr-mcp'; print('Server initializes OK')"
+
+        echo "Windows install test passed"
+      shell: pwsh

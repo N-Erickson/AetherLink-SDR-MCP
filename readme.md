@@ -59,7 +59,7 @@ AetherLink requires RTL-SDR drivers installed at the system level:
 | RTL-SDR | `brew install rtl-sdr` | `sudo apt install rtl-sdr librtlsdr-dev` | Required - SDR drivers |
 | rtl_433 | `brew install rtl_433` | `sudo apt install rtl-433` | Optional - ISM band devices |
 | SatDump | `brew install satdump` | [PPA instructions](https://github.com/SatDump/SatDump) | Optional - satellite imaging |
-| multimon-ng | Build from [source](https://github.com/EliasOenal/multimon-ng) | `sudo apt install multimon-ng` | Optional - POCSAG pagers |
+| multimon-ng | Built from [source](https://github.com/EliasOenal/multimon-ng) by installer | `sudo apt install multimon-ng` | Optional - POCSAG pagers |
 
 <details>
 <summary>Install from source (development)</summary>

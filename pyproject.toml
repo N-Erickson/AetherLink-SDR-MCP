@@ -1,6 +1,6 @@
 [project]
 name = "aetherlink"
-version = "0.1.1"
+version = "0.1.2"
 description = "MCP server for Software Defined Radio — control RTL-SDR & HackRF from Claude"
 authors = [{name = "N-Erickson"}]
 license = {text = "MIT"}
@@ -66,7 +66,7 @@ Repository = "https://github.com/N-Erickson/AetherLink-SDR-MCP"
 Issues = "https://github.com/N-Erickson/AetherLink-SDR-MCP/issues"
 
 [project.scripts]
-aetherlink = "sdr_mcp.server:run"
+aetherlink = "sdr_mcp.cli:run"
 
 [build-system]
 requires = ["hatchling"]

@@ -10,9 +10,9 @@ from typing import Optional, Any
 try:
     import rtlsdr
     RTLSDR_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError, OSError) as e:
     RTLSDR_AVAILABLE = False
-    logging.warning("RTL-SDR library not available. Install with: pip install pyrtlsdr")
+    logging.warning(f"RTL-SDR library not available: {e}. Install with: pip install pyrtlsdr")
 
 from .base import SDRDevice
 
