@@ -14,103 +14,52 @@ Control Software Defined Radios and decode radio protocols through an AI-friendl
 
 ## Installation
 
-### Prerequisites
+### Quick Install (Recommended)
 
-**1. RTL-SDR Drivers:**
+**macOS / Linux:**
 ```bash
-# macOS
-brew install librtlsdr
-
-# Ubuntu/Debian
-sudo apt-get install rtl-sdr librtlsdr-dev
-
-# Windows
-# Download from https://osmocom.org/projects/rtl-sdr/wiki
+curl -fsSL https://raw.githubusercontent.com/N-Erickson/AetherLink-SDR-MCP/main/install.sh | bash
 ```
 
-**2. RTL-SDR Tools:**
-```bash
-# macOS
-brew install rtl-sdr
-
-# Ubuntu/Debian
-sudo apt-get install rtl-sdr
-
-# Includes: rtl_fm, rtl_adsb, rtl_test
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/N-Erickson/AetherLink-SDR-MCP/main/install.ps1 | iex
 ```
 
-**3. SatDump for Meteor-M LRPT decoding (required for weather satellites):**
+The installer will:
+- Install RTL-SDR drivers and tools (via Homebrew / apt / manual links)
+- Prompt for optional decoders (rtl_433, SatDump)
+- Clone the repo, create a Python venv, and install dependencies
+- Offer to configure Claude Desktop automatically
+
+> **Windows users:** You also need [Zadig](https://zadig.akeo.ie/) to replace the RTL-SDR USB driver with WinUSB. The installer will walk you through this.
+
+### Manual Install
+
+<details>
+<summary>Click to expand manual installation steps</summary>
+
+**Prerequisites:** Python 3.10+, Git
+
+**1. System dependencies:**
+
+| Tool | macOS | Ubuntu/Debian | Purpose |
+|------|-------|---------------|---------|
+| RTL-SDR | `brew install rtl-sdr` | `sudo apt install rtl-sdr librtlsdr-dev` | Required - SDR drivers |
+| rtl_433 | `brew install rtl_433` | `sudo apt install rtl-433` | Optional - ISM band devices |
+| SatDump | `brew install satdump` | [PPA instructions](https://github.com/SatDump/SatDump) | Optional - satellite imaging |
+| multimon-ng | Build from [source](https://github.com/EliasOenal/multimon-ng) | `sudo apt install multimon-ng` | Optional - POCSAG pagers |
+
+**2. Install AetherLink:**
 ```bash
-# macOS
-brew install satdump
-
-# Fix SatDump resource paths (required on macOS - the cask doesn't set these up correctly)
-# Step 1: Symlink all resources to /usr/local/share/satdump/
-sudo mkdir -p /usr/local/share/satdump
-cd /Applications/SatDump.app/Contents/Resources
-sudo cp -R * /usr/local/share/satdump/
-
-# Step 2: Symlink plugins directory to /usr/local/lib/satdump/
-sudo mkdir -p /usr/local/lib/satdump
-sudo ln -sf /Applications/SatDump.app/Contents/Resources/plugins /usr/local/lib/satdump/plugins
-
-# Ubuntu/Debian
-sudo add-apt-repository ppa:satdump/satdump
-sudo apt-get update
-sudo apt-get install satdump
-
-# Enables Meteor-M2-3/M2-4 LRPT weather satellite decoding
-```
-
-**4. rtl_433 for ISM band decoding (optional but recommended):**
-```bash
-# macOS
-brew install rtl_433
-
-# Ubuntu/Debian
-sudo apt-get install rtl-433
-
-# Enables decoding of 433MHz/315MHz devices
-```
-
-**5. POCSAG Decoder (optional):**
-```bash
-# Clone and build multimon-ng
-cd /tmp
-git clone https://github.com/EliasOenal/multimon-ng.git
-cd multimon-ng
-mkdir build && cd build
-cmake ..
-make
-
-# Binary will be at: /tmp/multimon-ng/build/multimon-ng
-```
-
-**5. Python 3.10+**
-
-### Install from Source
-
-```bash
-# Clone the repository
 git clone https://github.com/N-Erickson/AetherLink-SDR-MCP
 cd AetherLink-SDR-MCP
-
-# Create virtual environment
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -e .
 ```
 
-### Required Python Packages
-
-The following are installed automatically:
-- `pyrtlsdr` - RTL-SDR hardware interface
-- `numpy` - Signal processing
-- `scipy` - Filtering and demodulation
-- `mcp` - Model Context Protocol server
-- `pyModeS` - ADS-B decoding (optional)
+</details>
 
 ## Quick Start
 
