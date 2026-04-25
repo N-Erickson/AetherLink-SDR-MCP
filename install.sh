@@ -331,15 +331,12 @@ install_aetherlink() {
     else
         # Create a dedicated venv -- works everywhere
         local venv_dir="$HOME/.aetherlink"
-        if [ -d "$venv_dir" ]; then
-            info "Upgrading existing install at $venv_dir..."
-            "$venv_dir/bin/pip" install --upgrade aetherlink -q 2>&1 | tail -3
-        else
-            info "Creating isolated environment at $venv_dir..."
-            $PYTHON -m venv "$venv_dir"
-            "$venv_dir/bin/pip" install --upgrade pip -q 2>&1 | tail -1
-            "$venv_dir/bin/pip" install aetherlink -q 2>&1 | tail -3
-        fi
+        info "Creating isolated environment at $venv_dir..."
+        # Always recreate venv to avoid stale entry points
+        rm -rf "$venv_dir"
+        $PYTHON -m venv "$venv_dir"
+        "$venv_dir/bin/pip" install --upgrade pip -q 2>&1 | tail -1
+        "$venv_dir/bin/pip" install aetherlink -q 2>&1 | tail -3
         AETHERLINK_CMD="$venv_dir/bin/aetherlink"
         ok "AetherLink installed in $venv_dir"
     fi
