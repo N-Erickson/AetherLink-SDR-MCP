@@ -325,7 +325,7 @@ class HackRFDevice(SDRDevice):
                 try:
                     self.rx_buffer.get_nowait()
                     self.rx_buffer.put_nowait(buffer)
-                except:
+                except Exception:
                     pass
             return 0
             
@@ -450,23 +450,24 @@ class HackRFDevice(SDRDevice):
         
     def validate_tx_safety(self, frequency: float, power_dbm: float = None) -> bool:
         """Validate transmission parameters for safety"""
-        # Safety checks
+        from ..utils.validators import is_restricted_frequency
+
         if frequency < 10e6:
             logger.error("Frequency below 10 MHz may damage HackRF!")
             return False
-            
-        # Check for restricted bands (simplified - add more as needed)
-        restricted_bands = [
-            (108e6, 137e6),    # Aviation
-            (406e6, 406.1e6),  # Emergency beacons
-            (1.215e9, 1.39e9), # GPS/GNSS
-        ]
-        
-        for low, high in restricted_bands:
-            if low <= frequency <= high:
-                logger.error(f"Frequency {frequency/1e6:.3f} MHz is in restricted band!")
-                return False
-                
+
+        if frequency > 6e9:
+            logger.error("Frequency above 6 GHz is outside HackRF range!")
+            return False
+
+        if is_restricted_frequency(frequency):
+            logger.error(f"Frequency {frequency/1e6:.3f} MHz is in a restricted band!")
+            return False
+
+        if power_dbm is not None and power_dbm > 15.0:
+            logger.error(f"TX power {power_dbm} dBm exceeds safe limit!")
+            return False
+
         return True
 
 # Fallback mock implementation if HackRF not available

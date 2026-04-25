@@ -13,14 +13,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
       with:
-        python-version: "3.11"
+        python-version: ${{ matrix.python-version }}
 
     - name: Install dependencies
       run: |
@@ -37,8 +40,10 @@ jobs:
         from sdr_mcp.analysis.spectrum import SpectrumAnalyzer, SignalRecorder, AudioRecorder
         from sdr_mcp.decoders.pocsag import POCSAGDecoder
         from sdr_mcp.decoders.ais import AISDecoder
-        from sdr_mcp.decoders.noaa_apt import NOAAAPTDecoder
-        print('✅ All imports successful')
+        from sdr_mcp.decoders.rtl433 import RTL433Decoder
+        from sdr_mcp.decoders.meteor_lrpt import MeteorLRPTDecoder
+        from sdr_mcp.utils.validators import sanitize_path_component, is_restricted_frequency, find_binary
+        print('All imports successful')
         "
 
     - name: Sanity check - server initialization
@@ -48,18 +53,44 @@ jobs:
         server = SDRMCPServer()
         assert server.server.name == 'sdr-mcp'
         assert server.sdr is None  # No hardware connected
-        print('✅ Server initializes without hardware')
+        print('Server initializes without hardware')
         "
 
     - name: Sanity check - decoders instantiate
       run: |
         python -c "
-        from sdr_mcp.server import ADSBDecoder, POCSAGDecoder, AISDecoder, NOAAAPTDecoder
+        from sdr_mcp.server import ADSBDecoder
+        from sdr_mcp.decoders.pocsag import POCSAGDecoder
+        from sdr_mcp.decoders.ais import AISDecoder
+        from sdr_mcp.decoders.rtl433 import RTL433Decoder
+        from sdr_mcp.decoders.meteor_lrpt import MeteorLRPTDecoder
         adsb = ADSBDecoder()
         pocsag = POCSAGDecoder()
         ais = AISDecoder()
-        noaa = NOAAAPTDecoder()
-        print('✅ All decoders instantiate')
+        rtl433 = RTL433Decoder()
+        meteor = MeteorLRPTDecoder()
+        print('All decoders instantiate')
+        "
+
+    - name: Sanity check - validators
+      run: |
+        python -c "
+        from sdr_mcp.utils.validators import sanitize_path_component, is_restricted_frequency
+
+        # Path traversal blocked
+        try:
+            sanitize_path_component('../etc/evil')
+            assert False, 'Should have raised ValueError'
+        except ValueError:
+            pass
+
+        # Valid names pass
+        assert sanitize_path_component('METEOR-M2-4') == 'METEOR-M2-4'
+
+        # Restricted frequency detection
+        assert is_restricted_frequency(121.5e6) == True   # Aviation
+        assert is_restricted_frequency(433.92e6) == False  # ISM band
+        print('Validators working correctly')
         "
 
     - name: Sanity check - audio recorder
@@ -69,5 +100,5 @@ jobs:
         recorder = AudioRecorder()
         assert recorder.audio_rate == 48000
         assert recorder.base_path == '/tmp/sdr_recordings'
-        print('✅ AudioRecorder initializes')
+        print('AudioRecorder initializes')
         "

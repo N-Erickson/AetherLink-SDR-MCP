@@ -6,6 +6,7 @@ Common protocols: Weather stations, tire pressure monitors, doorbells, sensors
 
 import json
 import logging
+from collections import deque
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -51,7 +52,7 @@ class RTL433Decoder:
     def __init__(self):
         self.devices: Dict[str, RTL433Device] = {}  # Key: "{model}_{id}"
         self.message_count = 0
-        self.raw_messages: List[Dict[str, Any]] = []
+        self.raw_messages: deque = deque(maxlen=1000)
         self.frequencies: List[float] = [433.92e6, 315e6]  # Default frequencies
         self.hop_interval: int = 30  # Default hop interval in seconds
 
@@ -70,10 +71,8 @@ class RTL433Decoder:
         try:
             data = json.loads(json_line)
 
-            # Store raw message
+            # Store raw message (deque auto-evicts oldest at maxlen)
             self.raw_messages.append(data)
-            if len(self.raw_messages) > 1000:  # Keep last 1000
-                self.raw_messages = self.raw_messages[-1000:]
 
             self.message_count += 1
 
