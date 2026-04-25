@@ -1,5 +1,9 @@
 # AetherLink-SDR-MCP: Software Defined Radio Model Context Protocol Server
 
+[![PyPI](https://img.shields.io/pypi/v/aetherlink)](https://pypi.org/project/aetherlink/)
+[![Python](https://img.shields.io/pypi/pyversions/aetherlink)](https://pypi.org/project/aetherlink/)
+[![License](https://img.shields.io/github/license/N-Erickson/AetherLink-SDR-MCP)](LICENSE)
+
 Control Software Defined Radios and decode radio protocols through an AI-friendly Model Context Protocol interface.
 
 ## Features
@@ -14,7 +18,23 @@ Control Software Defined Radios and decode radio protocols through an AI-friendl
 
 ## Installation
 
-### Quick Install (Recommended)
+### From PyPI (Recommended)
+
+```bash
+pip install aetherlink
+aetherlink --setup
+```
+
+That's it. The `--setup` command auto-configures Claude Desktop -- it detects your OS, finds the config file, and adds AetherLink without touching your other MCP servers. Then restart Claude Desktop.
+
+Or if you prefer [uvx](https://docs.astral.sh/uv/) (no install needed):
+```bash
+uvx aetherlink --setup
+```
+
+> **Note:** You still need RTL-SDR system drivers installed. See [System Dependencies](#system-dependencies) below.
+
+### Full Installer (includes system drivers)
 
 **macOS / Linux:**
 ```bash
@@ -26,22 +46,13 @@ curl -fsSL https://raw.githubusercontent.com/N-Erickson/AetherLink-SDR-MCP/main/
 irm https://raw.githubusercontent.com/N-Erickson/AetherLink-SDR-MCP/main/install.ps1 | iex
 ```
 
-The installer will:
-- Install RTL-SDR drivers and tools (via Homebrew / apt / manual links)
-- Prompt for optional decoders (rtl_433, SatDump)
-- Clone the repo, create a Python venv, and install dependencies
-- Offer to configure Claude Desktop automatically
+The installer handles everything: system drivers, Python package, optional decoders, and Claude Desktop configuration.
 
 > **Windows users:** You also need [Zadig](https://zadig.akeo.ie/) to replace the RTL-SDR USB driver with WinUSB. The installer will walk you through this.
 
-### Manual Install
+### System Dependencies
 
-<details>
-<summary>Click to expand manual installation steps</summary>
-
-**Prerequisites:** Python 3.10+, Git
-
-**1. System dependencies:**
+AetherLink requires RTL-SDR drivers installed at the system level:
 
 | Tool | macOS | Ubuntu/Debian | Purpose |
 |------|-------|---------------|---------|
@@ -50,13 +61,15 @@ The installer will:
 | SatDump | `brew install satdump` | [PPA instructions](https://github.com/SatDump/SatDump) | Optional - satellite imaging |
 | multimon-ng | Build from [source](https://github.com/EliasOenal/multimon-ng) | `sudo apt install multimon-ng` | Optional - POCSAG pagers |
 
-**2. Install AetherLink:**
+<details>
+<summary>Install from source (development)</summary>
+
 ```bash
 git clone https://github.com/N-Erickson/AetherLink-SDR-MCP
 cd AetherLink-SDR-MCP
 python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -e .
+source venv/bin/activate
+pip install -e ".[dev]"
 ```
 
 </details>

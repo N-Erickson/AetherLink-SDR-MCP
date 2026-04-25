@@ -1,25 +1,35 @@
 [project]
 name = "aetherlink"
 version = "0.1.0"
-description = "MCP server for SDR control with protocol decoding"
+description = "MCP server for Software Defined Radio — control RTL-SDR & HackRF from Claude"
 authors = [{name = "N-Erickson"}]
 license = {text = "MIT"}
 readme = "readme.md"
 requires-python = ">=3.10"
-keywords = ["sdr", "mcp", "rtl-sdr", "hackrf", "radio", "adsb"]
+keywords = [
+    "sdr", "rtl-sdr", "hackrf", "radio",
+    "mcp", "model-context-protocol", "claude",
+    "adsb", "ais", "pocsag", "satellite",
+    "spectrum-analysis", "signal-processing",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: Scientific/Engineering",
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.23.0",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
     "pyrtlsdr>=0.3.0",
@@ -36,14 +46,17 @@ analysis = [
     "matplotlib>=3.6.0",
     "scikit-rf>=0.29.0",
 ]
+all = [
+    "aetherlink[hackrf,decoders,analysis]",
+]
 dev = [
+    "aetherlink[all]",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "pre-commit>=3.0.0",
 ]
 
 [project.urls]
@@ -54,7 +67,6 @@ Issues = "https://github.com/N-Erickson/AetherLink-SDR-MCP/issues"
 
 [project.scripts]
 aetherlink = "sdr_mcp.server:run"
-aetherlink-test = "sdr_mcp.utils.test_hardware:main"
 
 [build-system]
 requires = ["hatchling"]

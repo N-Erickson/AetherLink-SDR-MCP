@@ -1,0 +1,77 @@
+name: Release
+
+# Manually trigger with version bump type
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Configure git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Bump version
+      id: bump
+      run: |
+        # Read current version
+        CURRENT=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+        echo "Current version: $CURRENT"
+
+        IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+        case "${{ inputs.bump }}" in
+          major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+          minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+          patch) PATCH=$((PATCH + 1)) ;;
+        esac
+
+        NEW="${MAJOR}.${MINOR}.${PATCH}"
+        echo "New version: $NEW"
+        echo "version=$NEW" >> "$GITHUB_OUTPUT"
+
+        # Update pyproject.toml
+        sed -i "s/^version = \".*\"/version = \"${NEW}\"/" pyproject.toml
+
+        # Update __init__.py
+        sed -i "s/^__version__ = \".*\"/__version__ = \"${NEW}\"/" sdr_mcp/__init__.py
+
+    - name: Commit and tag
+      run: |
+        VERSION="${{ steps.bump.outputs.version }}"
+        git add pyproject.toml sdr_mcp/__init__.py
+        git commit -m "release: v${VERSION}"
+        git tag "v${VERSION}"
+        git push origin main --tags
+
+    - name: Create GitHub release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        VERSION="${{ steps.bump.outputs.version }}"
+        gh release create "v${VERSION}" \
+          --title "v${VERSION}" \
+          --generate-notes

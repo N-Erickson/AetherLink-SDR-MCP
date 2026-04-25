@@ -1,0 +1,60 @@
+name: Publish to PyPI
+
+# Triggered when a version tag is pushed (e.g. v0.2.0)
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - run: pip install -e .
+    - run: |
+        python -c "
+        from sdr_mcp.server import SDRMCPServer
+        server = SDRMCPServer()
+        assert server.server.name == 'sdr-mcp'
+        print('Sanity check passed')
+        "
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # Required for trusted publishing
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install build tools
+      run: pip install build
+
+    - name: Verify version matches tag
+      run: |
+        TAG="${GITHUB_REF#refs/tags/v}"
+        PKG_VER=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+        INIT_VER=$(python -c "exec(open('sdr_mcp/__init__.py').read()); print(__version__)")
+        echo "Tag: $TAG | pyproject.toml: $PKG_VER | __init__.py: $INIT_VER"
+        if [ "$TAG" != "$PKG_VER" ] || [ "$TAG" != "$INIT_VER" ]; then
+          echo "ERROR: Version mismatch! Update pyproject.toml and __init__.py to match tag."
+          exit 1
+        fi
+
+    - name: Build package
+      run: python -m build
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1

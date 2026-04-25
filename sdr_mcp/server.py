@@ -1639,9 +1639,116 @@ async def main():
     await server.run()
 
 
+def setup_claude_desktop():
+    """Configure Claude Desktop to use AetherLink MCP server."""
+    import sys
+    import platform
+
+    system = platform.system()
+    home = os.path.expanduser("~")
+
+    if system == "Darwin":
+        config_dir = os.path.join(home, "Library", "Application Support", "Claude")
+    elif system == "Windows":
+        config_dir = os.path.join(os.environ.get("APPDATA", home), "Claude")
+    else:
+        config_dir = os.path.join(home, ".config", "Claude")
+
+    config_file = os.path.join(config_dir, "claude_desktop_config.json")
+
+    # Determine the best command to use
+    uvx_path = shutil.which("uvx")
+    if uvx_path:
+        server_entry = {"command": uvx_path, "args": ["aetherlink"]}
+    else:
+        # Fall back to the installed entry point
+        aetherlink_path = shutil.which("aetherlink")
+        if aetherlink_path:
+            server_entry = {"command": aetherlink_path, "args": []}
+        else:
+            # Fall back to python -m
+            server_entry = {"command": sys.executable, "args": ["-m", "sdr_mcp.server"]}
+
+    mcp_config = {
+        "command": server_entry["command"],
+        "args": server_entry["args"],
+    }
+
+    # Load existing config -- preserve everything, only add/update aetherlink
+    config = {}
+    if os.path.exists(config_file):
+        with open(config_file, "r") as f:
+            try:
+                config = json.load(f)
+            except json.JSONDecodeError:
+                print(f"Warning: {config_file} has invalid JSON, creating backup...")
+                backup = config_file + ".bak"
+                shutil.copy2(config_file, backup)
+                print(f"  Backup saved to {backup}")
+
+    if "mcpServers" not in config:
+        config["mcpServers"] = {}
+
+    if "aetherlink" in config["mcpServers"]:
+        print(f"AetherLink already configured in {config_file}")
+        print(f"  command: {config['mcpServers']['aetherlink'].get('command')}")
+        print()
+        answer = input("Update AetherLink entry? (other servers untouched) [y/N] ").strip().lower()
+        if answer != "y":
+            print("No changes made.")
+            return
+
+    other_servers = [k for k in config["mcpServers"] if k != "aetherlink"]
+    if other_servers:
+        print(f"Existing MCP servers (untouched): {', '.join(other_servers)}")
+
+    config["mcpServers"]["aetherlink"] = mcp_config
+
+    os.makedirs(config_dir, exist_ok=True)
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=2)
+
+    print(f"Added AetherLink to {config_file}")
+    print()
+    print(f"  command: {mcp_config['command']}")
+    if mcp_config["args"]:
+        print(f"  args:    {mcp_config['args']}")
+    print()
+    print("Restart Claude Desktop to activate AetherLink.")
+
+    # Check system deps
+    print()
+    print("System dependencies:")
+    for name, desc, hint in [
+        ("rtl_test", "RTL-SDR drivers", "brew install rtl-sdr"),
+        ("rtl_adsb", "ADS-B decoder", "brew install rtl-sdr"),
+        ("rtl_433", "ISM band decoder", "brew install rtl_433"),
+        ("satdump", "Satellite decoder", "brew install satdump"),
+    ]:
+        if shutil.which(name):
+            print(f"  + {desc} ({name})")
+        else:
+            print(f"  - {desc} ({name}) -- install with: {hint}")
+
+
 def run():
     """Synchronous entry point for console_scripts."""
-    asyncio.run(main())
+    import sys
+
+    if "--setup" in sys.argv or "setup" in sys.argv[1:2]:
+        setup_claude_desktop()
+    elif "--version" in sys.argv:
+        from . import __version__
+        print(f"aetherlink {__version__}")
+    elif "--help" in sys.argv or "-h" in sys.argv:
+        print("aetherlink - SDR MCP Server")
+        print()
+        print("Usage:")
+        print("  aetherlink           Start the MCP server (stdio)")
+        print("  aetherlink --setup   Configure Claude Desktop")
+        print("  aetherlink --version Show version")
+    else:
+        asyncio.run(main())
 
 
 if __name__ == "__main__":
