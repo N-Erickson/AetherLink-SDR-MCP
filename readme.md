@@ -137,9 +137,11 @@ You should see: "Successfully connected to RTL-SDR"
 ### Protocol Details
 
 **ADS-B (1090 MHz):**
-- Uses `rtl_adsb` subprocess for demodulation
-- pyModeS for message decoding
-- Tracks aircraft position, speed, altitude, callsign
+- Uses `dump1090` subprocess for demodulation and raw TCP output
+- pyModeS for DF/CRC-filtered ADS-B message decoding
+- Tracks callsign, altitude, speed, heading, vertical rate, message count
+- Optional aircraft registration/type/operator lookup via hexdb.io
+- Emits live tracking links for observed ICAO addresses
 - **FULLY TESTED AND WORKING**
 
 **POCSAG (152/454/929 MHz):**
@@ -344,12 +346,12 @@ AetherLink-SDR-MCP/
 
 **Device Management:**
 - RTL-SDR and subprocess decoders use **exclusive device access**
-- Python SDR control and subprocess tools (rtl_adsb, rtl_433) cannot run simultaneously
+- Python SDR control and subprocess tools (dump1090, rtl_433) cannot run simultaneously
 - Subprocess-based decoders automatically disconnect Python SDR
 - Stopping decoder reconnects Python SDR control
 
 **Decoders:**
-- ADS-B: `rtl_adsb` subprocess + pyModeS
+- ADS-B: `dump1090` subprocess + pyModeS + optional hexdb.io lookup
 - ISM Band: `rtl_433` subprocess with JSON output + multi-frequency hopping
 - POCSAG: `rtl_fm` + `multimon-ng` pipeline
 - AIS: Built-in GMSK demodulator (simplified)

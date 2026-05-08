@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def test_import():
     """Test that the package can be imported"""
     import sdr_mcp
-    assert sdr_mcp.__version__ == "0.1.0"
+    assert sdr_mcp.__version__ == "0.1.2"
 
 
 def test_server_creation():
@@ -44,6 +44,27 @@ def test_adsb_decoder():
     decoder = ADSBDecoder()
     assert len(decoder.aircraft) == 0
     assert decoder.message_count == 0
+
+
+def test_adsb_decoder_decodes_valid_messages():
+    """Test ADS-B decoding against current pyModeS API"""
+    from sdr_mcp import server as server_module
+
+    if not server_module.ADSB_AVAILABLE:
+        pytest.skip("pyModeS not installed")
+
+    decoder = server_module.ADSBDecoder()
+
+    callsign = decoder.decode_message("8D406B902015A678D4D220AA4BDA")
+    assert callsign is not None
+    assert callsign["icao"] == "406B90"
+    assert callsign["aircraft"]["callsign"] == "EZY85MH"
+
+    velocity = decoder.decode_message("8D485020994409940838175B284F")
+    assert velocity is not None
+    aircraft = velocity["aircraft"]
+    assert aircraft["speed"] == 159
+    assert aircraft["vertical_rate"] == -832
 
 
 if __name__ == "__main__":

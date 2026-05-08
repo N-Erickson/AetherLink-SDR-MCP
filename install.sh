@@ -396,7 +396,7 @@ print_summary() {
     echo ""
     echo "  System tools:"
     check_tool rtl_test    "RTL-SDR drivers"
-    check_tool rtl_adsb    "ADS-B decoder"
+    check_tool dump1090    "ADS-B decoder"
     check_tool rtl_433     "ISM band decoder"
     check_tool satdump     "Satellite decoder"
     check_tool multimon-ng "POCSAG decoder"
