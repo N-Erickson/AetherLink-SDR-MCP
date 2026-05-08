@@ -1604,7 +1604,12 @@ class SDRMCPServer:
         process = None
         writer = None
         try:
-            dump1090_path = find_binary("dump1090", "install dump1090 or dump1090-fa")
+            # Homebrew packages FlightAware dump1090 as dump1090-fa, but it provides
+            # the dump1090 executable we invoke here.
+            dump1090_path = find_binary(
+                "dump1090",
+                "brew install dump1090-fa",
+            )
             cmd = [
                 dump1090_path,
                 "--net",
@@ -2064,7 +2069,8 @@ def setup_claude_desktop():
     print("System dependencies:")
     for name, desc, hint in [
         ("rtl_test", "RTL-SDR drivers", "brew install rtl-sdr"),
-        ("dump1090", "ADS-B decoder", "install dump1090 or dump1090-fa"),
+        # Homebrew package name is dump1090-fa; the installed binary is dump1090.
+        ("dump1090", "ADS-B decoder", "brew install dump1090-fa"),
         ("rtl_433", "ISM band decoder", "brew install rtl_433"),
         ("satdump", "Satellite decoder", "brew install satdump"),
     ]:
