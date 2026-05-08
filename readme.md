@@ -57,6 +57,7 @@ AetherLink requires RTL-SDR drivers installed at the system level:
 | Tool | macOS | Ubuntu/Debian | Purpose |
 |------|-------|---------------|---------|
 | RTL-SDR | `brew install rtl-sdr` | `sudo apt install rtl-sdr librtlsdr-dev` | Required - SDR drivers |
+| dump1090 | `brew install dump1090-fa` | `sudo apt install dump1090-fa` | Optional - ADS-B aircraft tracking |
 | rtl_433 | `brew install rtl_433` | `sudo apt install rtl-433` | Optional - ISM band devices |
 | SatDump | `brew install satdump` | [PPA instructions](https://github.com/SatDump/SatDump) | Optional - satellite imaging |
 | multimon-ng | Built from [source](https://github.com/EliasOenal/multimon-ng) by installer | `sudo apt install multimon-ng` | Optional - POCSAG pagers |

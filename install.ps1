@@ -111,6 +111,17 @@ function Install-SystemDeps {
         }
     }
 
+    # dump1090
+    if (Get-Command dump1090 -ErrorAction SilentlyContinue) {
+        Write-Ok "dump1090 found"
+    } else {
+        if (Prompt-YesNo "Open dump1090 download page? (ADS-B aircraft tracking)") {
+            Start-Process "https://github.com/flightaware/dump1090"
+        } else {
+            Write-Warn "Skipped dump1090 (optional)"
+        }
+    }
+
     Write-Host ""
 }
 

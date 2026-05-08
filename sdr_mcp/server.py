@@ -28,6 +28,7 @@ from .analysis.spectrum import SpectrumAnalyzer, SignalRecorder, FrequencyScanne
 # Import validators
 from .utils.validators import sanitize_path_component, is_restricted_frequency, find_binary
 
+from . import __version__
 from .decoders.adsb import ADSBDecoder, ADSB_AVAILABLE
 from .decoders.pocsag import POCSAGDecoder
 from .decoders.ais import AISDecoder
@@ -69,7 +70,7 @@ class SDRMCPServer:
     def __init__(self):
         self.server = Server(
             "sdr-mcp",
-            version="0.1.0",
+            version=__version__,
             instructions=(
                 "AetherLink SDR MCP Server. Controls RTL-SDR and HackRF software-defined "
                 "radio hardware for spectrum analysis, signal decoding (ADS-B aircraft, AIS "

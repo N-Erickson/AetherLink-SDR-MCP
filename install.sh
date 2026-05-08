@@ -178,6 +178,9 @@ install_system_deps() {
 
     # multimon-ng
     install_multimon_ng
+
+    # dump1090
+    install_dump1090
 }
 
 setup_linux_udev() {
@@ -308,6 +311,34 @@ install_multimon_ng() {
         warn "Failed to clone multimon-ng repository"
     fi
     rm -rf "$build_dir"
+}
+
+install_dump1090() {
+    if command -v dump1090 &>/dev/null; then
+        ok "dump1090 already installed"
+        return
+    fi
+
+    if ! prompt_yn "Install dump1090 (ADS-B aircraft tracking)?"; then
+        warn "Skipped dump1090"
+        return
+    fi
+
+    case "$PKG_MGR" in
+        brew)
+            brew install dump1090-fa && ok "dump1090 installed" || warn "dump1090 install failed"
+            ;;
+        apt)
+            sudo apt-get install -y -qq dump1090-fa 2>/dev/null && ok "dump1090 installed" \
+                || warn "dump1090-fa not in repos. Install from: https://github.com/flightaware/dump1090"
+            ;;
+        dnf|pacman)
+            warn "dump1090 not in standard repos. Install from: https://github.com/flightaware/dump1090"
+            ;;
+        *)
+            warn "Install dump1090 manually: https://github.com/flightaware/dump1090"
+            ;;
+    esac
 }
 
 # ─── Install AetherLink Python package ────────────────────────────────────────
