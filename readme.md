@@ -139,6 +139,7 @@ You should see: "Successfully connected to RTL-SDR"
 **ADS-B (1090 MHz):**
 - Uses `dump1090` subprocess for demodulation and raw TCP output
 - pyModeS for DF/CRC-filtered ADS-B message decoding
+- Defaults to a 120-second capture; set `duration=0` to run until stopped
 - Tracks callsign, altitude, speed, heading, vertical rate, message count
 - Optional aircraft registration/type/operator lookup via hexdb.io
 - Emits live tracking links for observed ICAO addresses

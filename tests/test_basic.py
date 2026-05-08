@@ -67,6 +67,16 @@ def test_adsb_decoder_decodes_valid_messages():
     assert aircraft["speed"] == 159
     assert aircraft["vertical_rate"] == -832
 
+    tracked = decoder.get_aircraft_list()
+    assert tracked[0]["tracking_url"].endswith("?icao=406b90")
+
+    stats = decoder.get_statistics()
+    assert stats["raw_messages"] == 2
+    assert stats["decoded_messages"] == 2
+    assert stats["total_aircraft_seen"] == 2
+    assert stats["identified_callsigns"] == 1
+    assert stats["descending"] == 1
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

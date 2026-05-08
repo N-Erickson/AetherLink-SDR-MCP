@@ -174,7 +174,7 @@ class SDRMCPServer:
                             "duration": {
                                 "type": "integer",
                                 "description": "Optional tracking duration in seconds; 0 runs until stopped",
-                                "default": 0,
+                                "default": 120,
                                 "minimum": 0,
                             },
                             "aggressive": {
@@ -584,7 +584,8 @@ class SDRMCPServer:
                     )]
 
                 gain = arguments.get("gain", 40)
-                duration = int(arguments.get("duration", 0) or 0)
+                duration_arg = arguments.get("duration", 120)
+                duration = 120 if duration_arg is None else int(duration_arg)
                 aggressive = bool(arguments.get("aggressive", True))
                 fix_crc = bool(arguments.get("fix_crc", True))
 
@@ -1343,7 +1344,7 @@ class SDRMCPServer:
     async def _adsb_decoder_task(
         self,
         gain: str = "40",
-        duration: int = 0,
+        duration: int = 120,
         aggressive: bool = True,
         fix_crc: bool = True,
     ):
