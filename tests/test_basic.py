@@ -40,7 +40,8 @@ def test_spectrum_analyzer():
 
 def test_adsb_decoder():
     """Test ADS-B decoder creation"""
-    from sdr_mcp.server import ADSBDecoder
+    from sdr_mcp.decoders.adsb import ADSBDecoder
+
     decoder = ADSBDecoder()
     assert len(decoder.aircraft) == 0
     assert decoder.message_count == 0
@@ -48,12 +49,12 @@ def test_adsb_decoder():
 
 def test_adsb_decoder_decodes_valid_messages():
     """Test ADS-B decoding against current pyModeS API"""
-    from sdr_mcp import server as server_module
+    from sdr_mcp.decoders.adsb import ADSBDecoder, ADSB_AVAILABLE
 
-    if not server_module.ADSB_AVAILABLE:
+    if not ADSB_AVAILABLE:
         pytest.skip("pyModeS not installed")
 
-    decoder = server_module.ADSBDecoder()
+    decoder = ADSBDecoder()
 
     callsign = decoder.decode_message("8D406B902015A678D4D220AA4BDA")
     assert callsign is not None
