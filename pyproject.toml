@@ -1,6 +1,6 @@
 [project]
 name = "aetherlink"
-version = "0.1.2"
+version = "0.1.3"
 description = "MCP server for Software Defined Radio — control RTL-SDR & HackRF from Claude"
 authors = [{name = "N-Erickson"}]
 license = {text = "MIT"}
