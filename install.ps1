@@ -260,7 +260,7 @@ function Print-Summary {
 
     $tools = @(
         @("rtl_test",    "RTL-SDR drivers"),
-        @("rtl_adsb",    "ADS-B decoder"),
+        @("dump1090",    "ADS-B decoder"),
         @("rtl_433",     "ISM band decoder"),
         @("satdump",     "Satellite decoder"),
         @("multimon-ng", "POCSAG decoder")

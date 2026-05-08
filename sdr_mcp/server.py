@@ -28,14 +28,7 @@ from .analysis.spectrum import SpectrumAnalyzer, SignalRecorder, FrequencyScanne
 # Import validators
 from .utils.validators import sanitize_path_component, is_restricted_frequency, find_binary
 
-# Protocol decoder imports
-try:
-    import pyModeS as pms
-    ADSB_AVAILABLE = True
-except ImportError:
-    ADSB_AVAILABLE = False
-    logging.warning("ADS-B decoder not available. Install with: pip install pyModeS")
-
+from .decoders.adsb import ADSBDecoder, ADSB_AVAILABLE
 from .decoders.pocsag import POCSAGDecoder
 from .decoders.ais import AISDecoder
 from .decoders.rtl433 import RTL433Decoder
@@ -69,98 +62,6 @@ class SDRStatus:
     gain: float
     is_capturing: bool
     active_decoders: List[str]
-
-@dataclass
-class Aircraft:
-    """Tracked aircraft data"""
-    icao: str
-    callsign: Optional[str] = None
-    altitude: Optional[int] = None
-    speed: Optional[float] = None
-    heading: Optional[float] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    last_seen: datetime = None
-    message_count: int = 0
-
-class ADSBDecoder:
-    """ADS-B protocol decoder"""
-    def __init__(self):
-        self.aircraft: Dict[str, Aircraft] = {}
-        self.message_count = 0
-        
-    def decode_message(self, msg_hex: str) -> Optional[Dict[str, Any]]:
-        """Decode a single ADS-B message from hex string"""
-        if not ADSB_AVAILABLE:
-            return None
-
-        try:
-            # pyModeS expects hex strings, not bytes
-            if len(msg_hex) != 28:  # 14 bytes * 2 hex chars
-                return None
-
-            # Get ICAO address
-            icao = pms.adsb.icao(msg_hex)
-            if not icao:
-                return None
-
-            # Update or create aircraft entry
-            if icao not in self.aircraft:
-                self.aircraft[icao] = Aircraft(icao=icao, last_seen=datetime.now())
-
-            aircraft = self.aircraft[icao]
-            aircraft.last_seen = datetime.now()
-            aircraft.message_count += 1
-            self.message_count += 1
-
-            # Decode message type
-            tc = pms.adsb.typecode(msg_hex)
-
-            # Aircraft identification (callsign)
-            if 1 <= tc <= 4:
-                callsign = pms.adsb.callsign(msg_hex)
-                if callsign:
-                    aircraft.callsign = callsign.strip()
-
-            # Airborne position
-            elif tc in [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22]:
-                alt = pms.adsb.altitude(msg_hex)
-                if alt:
-                    aircraft.altitude = alt
-
-            # Airborne velocity
-            elif tc == 19:
-                velocity = pms.adsb.velocity(msg_hex)
-                if velocity:
-                    speed, heading, _, _ = velocity
-                    if speed:
-                        aircraft.speed = speed
-                    if heading:
-                        aircraft.heading = heading
-
-            return {
-                "icao": icao,
-                "aircraft": asdict(aircraft),
-                "message_type": tc,
-                "raw": msg_hex
-            }
-
-        except Exception as e:
-            logger.debug(f"Failed to decode ADS-B message: {e}")
-            return None
-            
-    def get_aircraft_list(self) -> List[Dict[str, Any]]:
-        """Get list of all tracked aircraft"""
-        now = datetime.now()
-        active_aircraft = []
-
-        for icao, aircraft in self.aircraft.items():
-            # Only include aircraft seen in last 120 seconds (2 minutes)
-            time_diff = (now - aircraft.last_seen).total_seconds()
-            if time_diff < 120:
-                active_aircraft.append(asdict(aircraft))
-
-        return active_aircraft
 
 class SDRMCPServer:
     """MCP Server for SDR control"""
@@ -261,8 +162,33 @@ class SDRMCPServer:
                 ),
                 Tool(
                     name="aviation_track_aircraft",
-                    description="Start tracking aircraft via ADS-B on 1090 MHz",
-                    inputSchema={"type": "object", "properties": {}}
+                    description="Start tracking aircraft via ADS-B on 1090 MHz using dump1090",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "gain": {
+                                "type": "number",
+                                "description": "RTL-SDR gain in dB for dump1090",
+                                "default": 40,
+                            },
+                            "duration": {
+                                "type": "integer",
+                                "description": "Optional tracking duration in seconds; 0 runs until stopped",
+                                "default": 120,
+                                "minimum": 0,
+                            },
+                            "aggressive": {
+                                "type": "boolean",
+                                "description": "Enable dump1090 aggressive mode",
+                                "default": True,
+                            },
+                            "fix_crc": {
+                                "type": "boolean",
+                                "description": "Enable dump1090 single-bit CRC correction",
+                                "default": True,
+                            },
+                        },
+                    }
                 ),
                 Tool(
                     name="aviation_stop_tracking",
@@ -272,7 +198,26 @@ class SDRMCPServer:
                 Tool(
                     name="aviation_get_aircraft",
                     description="Get list of currently tracked aircraft",
-                    inputSchema={"type": "object", "properties": {}}
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "max_age": {
+                                "type": "integer",
+                                "description": "Maximum aircraft age in seconds",
+                                "default": 120,
+                            },
+                            "include_inactive": {
+                                "type": "boolean",
+                                "description": "Include all aircraft seen since tracking started",
+                                "default": False,
+                            },
+                            "lookup_registrations": {
+                                "type": "boolean",
+                                "description": "Resolve registration, type, and operator via hexdb.io",
+                                "default": True,
+                            },
+                        },
+                    }
                 ),
                 Tool(
                     name="pager_start_decoding",
@@ -625,60 +570,168 @@ class SDRMCPServer:
                 return [TextContent(type="text", text=json.dumps(asdict(status), indent=2))]
                 
             elif name == "aviation_track_aircraft":
-                if "adsb" in self.active_decoders:
-                    return [TextContent(type="text", text="ADS-B tracking already active")]
+                existing_task = self.active_decoders.get("adsb")
+                if existing_task:
+                    if existing_task.done():
+                        self.active_decoders.pop("adsb", None)
+                    else:
+                        return [TextContent(type="text", text="ADS-B tracking already active")]
+
+                if not ADSB_AVAILABLE:
+                    return [TextContent(
+                        type="text",
+                        text="Failed to start ADS-B: pyModeS is not installed. Install with: pip install pyModeS",
+                    )]
+
+                gain = arguments.get("gain", 40)
+                duration_arg = arguments.get("duration", 120)
+                duration = 120 if duration_arg is None else int(duration_arg)
+                aggressive = bool(arguments.get("aggressive", True))
+                fix_crc = bool(arguments.get("fix_crc", True))
 
                 # Start ADS-B decoder task (will handle SDR access)
                 try:
-                    self.active_decoders["adsb"] = asyncio.create_task(self._adsb_decoder_task())
-                    await asyncio.sleep(2.0)  # Give it time to disconnect SDR and start rtl_adsb
+                    task = asyncio.create_task(
+                        self._adsb_decoder_task(
+                            gain=str(gain),
+                            duration=duration,
+                            aggressive=aggressive,
+                            fix_crc=fix_crc,
+                        )
+                    )
+                    self.active_decoders["adsb"] = task
+                    await asyncio.sleep(2.0)  # Give it time to disconnect SDR and start dump1090
 
                     # Check if it failed immediately
-                    if self.active_decoders["adsb"].done():
+                    if task.done():
+                        self.active_decoders.pop("adsb", None)
                         try:
-                            await self.active_decoders["adsb"]
+                            await task
                         except Exception as e:
-                            del self.active_decoders["adsb"]
                             return [TextContent(type="text", text=f"Failed to start ADS-B: {str(e)}\n\nMake sure the RTL-SDR is connected.")]
 
-                    return [TextContent(type="text", text="Started ADS-B aircraft tracking on 1090 MHz\n\nNOTE: Python SDR control is paused while tracking.\nUse aviation_stop_tracking to regain SDR control.")]
+                    duration_msg = (
+                        "until stopped" if duration <= 0 else f"for {duration} seconds"
+                    )
+                    return [TextContent(
+                        type="text",
+                        text=(
+                            "Started ADS-B aircraft tracking on 1090 MHz with dump1090\n"
+                            f"Gain: {gain} dB | Duration: {duration_msg}\n\n"
+                            "NOTE: Python SDR control is paused while tracking.\n"
+                            "Use aviation_stop_tracking to regain SDR control."
+                        ),
+                    )]
                 except Exception as e:
                     return [TextContent(type="text", text=f"Failed to start ADS-B tracking: {str(e)}")]
                 
             elif name == "aviation_stop_tracking":
-                if "adsb" in self.active_decoders:
-                    self.active_decoders["adsb"].cancel()
-                    del self.active_decoders["adsb"]
+                task = self.active_decoders.pop("adsb", None)
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
                     return [TextContent(type="text", text="Stopped ADS-B tracking")]
                 else:
                     return [TextContent(type="text", text="ADS-B tracking not active")]
                     
             elif name == "aviation_get_aircraft":
-                # Get aircraft list and log details
-                aircraft_list = self.adsb_decoder.get_aircraft_list()
-                total_tracked = len(self.adsb_decoder.aircraft)
+                max_age = int(arguments.get("max_age", 120) or 120)
+                include_inactive = bool(arguments.get("include_inactive", False))
+                lookup_registrations = bool(arguments.get("lookup_registrations", True))
 
-                logger.info(f"Total aircraft ever seen: {total_tracked}")
-                logger.info(f"Active aircraft (last 2 min): {len(aircraft_list)}")
-                logger.info(f"Total messages decoded: {self.adsb_decoder.message_count}")
+                aircraft_list = self.adsb_decoder.get_aircraft_list(
+                    max_age_seconds=max_age,
+                    include_inactive=include_inactive,
+                )
 
-                summary = f"Tracking {len(aircraft_list)} active aircraft\n"
-                summary += f"Total messages decoded: {self.adsb_decoder.message_count}\n"
-                summary += f"Total aircraft seen: {total_tracked}\n\n"
+                if lookup_registrations and aircraft_list:
+                    await asyncio.gather(*[
+                        asyncio.to_thread(self.adsb_decoder.lookup_aircraft, ac["icao"])
+                        for ac in aircraft_list[:25]
+                    ])
+                    aircraft_list = self.adsb_decoder.get_aircraft_list(
+                        max_age_seconds=max_age,
+                        include_inactive=include_inactive,
+                    )
 
-                if not aircraft_list and total_tracked > 0:
-                    summary += "⚠️  Aircraft were detected but none are active in the last 2 minutes.\n"
-                    summary += "This is normal - aircraft may have flown out of range.\n\n"
+                stats = self.adsb_decoder.get_statistics(max_age_seconds=max_age)
+                active_task = self.active_decoders.get("adsb")
+                decoder_active = bool(active_task and not active_task.done())
 
-                for aircraft in aircraft_list:
-                    summary += f"ICAO: {aircraft['icao']}"
-                    if aircraft['callsign']:
-                        summary += f" ({aircraft['callsign']})"
-                    if aircraft['altitude']:
-                        summary += f" - Alt: {aircraft['altitude']:,.0f} ft"
-                    if aircraft['speed']:
-                        summary += f" - Speed: {aircraft['speed']:.0f} kts"
-                    summary += f" - Messages: {aircraft['message_count']}\n"
+                logger.info(f"Total aircraft ever seen: {stats['total_aircraft_seen']}")
+                logger.info(f"Active aircraft: {len(aircraft_list)}")
+                logger.info(f"Total ADS-B messages decoded: {stats['decoded_messages']}")
+
+                summary = f"ADS-B Aircraft Tracker ({'active' if decoder_active else 'stopped'})\n"
+                summary += f"Raw messages: {stats['raw_messages']}\n"
+                summary += f"Decoded messages: {stats['decoded_messages']}\n"
+                summary += f"Aircraft seen: {stats['total_aircraft_seen']}\n"
+                summary += f"Active aircraft: {len(aircraft_list)}\n"
+                summary += (
+                    f"{stats['identified_callsigns']} callsigns | "
+                    f"{stats['with_altitude']} with altitude | "
+                    f"{stats['climbing']} climbing | {stats['descending']} descending\n\n"
+                )
+
+                if not aircraft_list and stats["total_aircraft_seen"] > 0:
+                    summary += (
+                        "Aircraft were detected, but none match the current age filter.\n"
+                        "Try include_inactive=true or a larger max_age value.\n\n"
+                    )
+                elif not aircraft_list:
+                    summary += "No aircraft detected yet. Try a longer run or check antenna placement.\n"
+                    return [TextContent(type="text", text=summary)]
+
+                if aircraft_list:
+                    summary += (
+                        f"{'ICAO':<8} {'Reg':<10} {'Call':<9} {'Operator':<18} "
+                        f"{'Type':<6} {'Alt':>8} {'Spd':>6} {'Hdg':>5} {'V/S':>7} {'Msgs':>5}\n"
+                    )
+                    summary += (
+                        f"{'-'*8} {'-'*10} {'-'*9} {'-'*18} {'-'*6} "
+                        f"{'-'*8} {'-'*6} {'-'*5} {'-'*7} {'-'*5}\n"
+                    )
+
+                    for aircraft in aircraft_list[:25]:
+                        reg = aircraft.get("registration") or ""
+                        callsign = aircraft.get("callsign") or ""
+                        operator = aircraft.get("operator") or ""
+                        if len(operator) > 17:
+                            operator = operator[:16] + "."
+                        icao_type = aircraft.get("icao_type") or ""
+                        alt = (
+                            f"{aircraft['altitude']:>7,}"
+                            if aircraft.get("altitude") is not None else "     --"
+                        )
+                        speed = (
+                            f"{aircraft['speed']:>5.0f}"
+                            if aircraft.get("speed") is not None else "   --"
+                        )
+                        heading = (
+                            f"{aircraft['heading']:>4.0f}"
+                            if aircraft.get("heading") is not None else "  --"
+                        )
+                        vertical_rate = (
+                            f"{aircraft['vertical_rate']:>+6.0f}"
+                            if aircraft.get("vertical_rate") is not None else "    --"
+                        )
+                        summary += (
+                            f"{aircraft['icao']:<8} {reg:<10} {callsign:<9} "
+                            f"{operator:<18} {icao_type:<6} {alt} {speed} "
+                            f"{heading:>4} {vertical_rate:>7} {aircraft['message_count']:>5}\n"
+                        )
+
+                    summary += "\nLive tracking links:\n"
+                    for aircraft in aircraft_list[:15]:
+                        label = " ".join(filter(None, [
+                            aircraft.get("registration") or aircraft["icao"],
+                            aircraft.get("operator") or "",
+                            aircraft.get("callsign") or "",
+                        ]))
+                        summary += f"  {label}: {aircraft['tracking_url']}\n"
 
                 return [TextContent(type="text", text=summary)]
 
@@ -1258,10 +1311,13 @@ class SDRMCPServer:
                 return json.dumps(status, indent=2)
                 
             elif uri == "aviation://aircraft":
+                active_task = self.active_decoders.get("adsb")
                 aircraft_data = {
                     "aircraft": self.adsb_decoder.get_aircraft_list(),
+                    "statistics": self.adsb_decoder.get_statistics(),
                     "total_messages": self.adsb_decoder.message_count,
-                    "decoder_active": "adsb" in self.active_decoders
+                    "raw_messages": self.adsb_decoder.raw_message_count,
+                    "decoder_active": bool(active_task and not active_task.done())
                 }
                 return json.dumps(aircraft_data, indent=2, default=str)
                 
@@ -1285,19 +1341,25 @@ class SDRMCPServer:
             else:
                 return f"Unknown resource: {uri}"
                 
-    async def _adsb_decoder_task(self):
-        """Background task for ADS-B decoding using rtl_adsb subprocess
+    async def _adsb_decoder_task(
+        self,
+        gain: str = "40",
+        duration: int = 120,
+        aggressive: bool = True,
+        fix_crc: bool = True,
+    ):
+        """Background task for ADS-B decoding using dump1090 raw TCP output.
 
         NOTE: This temporarily disconnects Python SDR control and gives
-        exclusive access to rtl_adsb. Other SDR functions won't work while this runs.
+        exclusive access to dump1090. Other SDR functions won't work while this runs.
         Stop tracking to regain SDR control.
         """
-        logger.info("Starting ADS-B decoder with rtl_adsb subprocess")
+        logger.info("Starting ADS-B decoder with dump1090 subprocess")
 
         # Disconnect Python SDR to free the device
         python_sdr_was_connected = self.sdr is not None
         if self.sdr:
-            logger.info("Releasing SDR device for rtl_adsb")
+            logger.info("Releasing SDR device for dump1090")
             await self.sdr.disconnect()
             self.sdr = None
 
@@ -1308,21 +1370,35 @@ class SDRMCPServer:
             logger.info("USB device released")
 
         process = None
+        writer = None
         try:
-            # Find rtl_adsb binary
-            rtl_adsb_path = find_binary("rtl_adsb", "brew install rtl-sdr")
+            # Homebrew packages FlightAware dump1090 as dump1090-fa, but it provides
+            # the dump1090 executable we invoke here.
+            dump1090_path = find_binary(
+                "dump1090",
+                "brew install dump1090-fa",
+            )
+            cmd = [
+                dump1090_path,
+                "--net",
+                "--gain", gain,
+                "--quiet",
+            ]
+            if fix_crc:
+                cmd.append("--fix")
+            if aggressive:
+                cmd.append("--aggressive")
 
-            logger.info(f"Found rtl_adsb at: {rtl_adsb_path}")
-            logger.info("Starting rtl_adsb subprocess...")
+            logger.info(f"Found dump1090 at: {dump1090_path}")
+            logger.info(f"Starting dump1090 subprocess: {' '.join(cmd)}")
 
-            # Start rtl_adsb subprocess
             process = await asyncio.create_subprocess_exec(
-                rtl_adsb_path,
-                stdout=asyncio.subprocess.PIPE,
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE
             )
 
-            logger.info(f"rtl_adsb started (PID: {process.pid})")
+            logger.info(f"dump1090 started (PID: {process.pid})")
 
             # Monitor stderr for errors
             async def check_stderr():
@@ -1333,33 +1409,63 @@ class SDRMCPServer:
                         if line:
                             decoded = line.decode().strip()
                             first_lines.append(decoded)
-                            logger.info(f"rtl_adsb: {decoded}")
+                            logger.info(f"dump1090: {decoded}")
                             if 'error' in decoded.lower() or 'failed' in decoded.lower():
-                                logger.error(f"rtl_adsb ERROR: {decoded}")
+                                logger.error(f"dump1090 ERROR: {decoded}")
                 except asyncio.TimeoutError:
                     pass  # No more stderr
                 return first_lines
 
-            logger.info("Reading rtl_adsb startup messages...")
+            logger.info("Reading dump1090 startup messages...")
             stderr_lines = await check_stderr()
             logger.info(f"Got {len(stderr_lines)} stderr lines")
 
             # Check if it started successfully
             if any('Failed' in line or 'error -' in line for line in stderr_lines):
                 error_msg = '\n'.join(stderr_lines)
-                logger.error(f"rtl_adsb FAILED TO START:\n{error_msg}")
-                raise RuntimeError(f"rtl_adsb failed: {error_msg}")
+                logger.error(f"dump1090 FAILED TO START:\n{error_msg}")
+                raise RuntimeError(f"dump1090 failed: {error_msg}")
+
+            # dump1090 needs a moment before the Beast/raw TCP ports are ready.
+            reader = None
+            for attempt in range(10):
+                if process.returncode is not None:
+                    raise RuntimeError(f"dump1090 exited early with code {process.returncode}")
+                try:
+                    reader, writer = await asyncio.open_connection("127.0.0.1", 30002)
+                    break
+                except OSError:
+                    await asyncio.sleep(0.5)
+
+            if reader is None:
+                raise RuntimeError("Could not connect to dump1090 raw output on 127.0.0.1:30002")
 
             msg_count = 0
             decode_count = 0
             last_log_time = asyncio.get_event_loop().time()
+            deadline = (
+                asyncio.get_event_loop().time() + duration
+                if duration and duration > 0 else None
+            )
 
             # Read and decode messages
             while True:
-                line = await process.stdout.readline()
-                if not line:
-                    logger.error("rtl_adsb output ended")
+                if deadline and asyncio.get_event_loop().time() >= deadline:
+                    logger.info("ADS-B tracking duration reached")
                     break
+
+                if process.returncode is not None:
+                    logger.error(f"dump1090 exited with code {process.returncode}")
+                    break
+
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                if not line:
+                    await asyncio.sleep(0.2)
+                    continue
 
                 msg_line = line.decode().strip()
                 if msg_line.startswith('*') and msg_line.endswith(';'):
@@ -1387,12 +1493,22 @@ class SDRMCPServer:
             raise
         finally:
             # Cleanup
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
             if process:
                 process.terminate()
                 try:
                     await asyncio.wait_for(process.wait(), timeout=2.0)
                 except (asyncio.TimeoutError, Exception):
                     process.kill()
+                    try:
+                        await process.wait()
+                    except Exception:
+                        pass
 
             # Reconnect Python SDR if it was connected before
             if python_sdr_was_connected:
@@ -1721,7 +1837,8 @@ def setup_claude_desktop():
     print("System dependencies:")
     for name, desc, hint in [
         ("rtl_test", "RTL-SDR drivers", "brew install rtl-sdr"),
-        ("rtl_adsb", "ADS-B decoder", "brew install rtl-sdr"),
+        # Homebrew package name is dump1090-fa; the installed binary is dump1090.
+        ("dump1090", "ADS-B decoder", "brew install dump1090-fa"),
         ("rtl_433", "ISM band decoder", "brew install rtl_433"),
         ("satdump", "Satellite decoder", "brew install satdump"),
     ]:
