@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/n-erickson-aetherlink-sdr-mcp-badge.png)](https://mseep.ai/app/n-erickson-aetherlink-sdr-mcp)
+
 # AetherLink-SDR-MCP: Software Defined Radio Model Context Protocol Server
 
 [![PyPI](https://img.shields.io/pypi/v/aetherlink)](https://pypi.org/project/aetherlink/)
