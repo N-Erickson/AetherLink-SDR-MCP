@@ -122,6 +122,28 @@ function Install-SystemDeps {
         }
     }
 
+    # multimon-ng (POCSAG)
+    if (Get-Command multimon-ng -ErrorAction SilentlyContinue) {
+        Write-Ok "multimon-ng found"
+    } else {
+        if (Prompt-YesNo "Open multimon-ng page? (POCSAG pager decoding, needs rtl_fm from the RTL-SDR binaries)") {
+            Start-Process "https://github.com/EliasOenal/multimon-ng"
+        } else {
+            Write-Warn "Skipped multimon-ng (optional)"
+        }
+    }
+
+    # AIS-catcher (AIS)
+    if ((Get-Command AIS-catcher -ErrorAction SilentlyContinue) -or (Get-Command rtl_ais -ErrorAction SilentlyContinue)) {
+        Write-Ok "AIS receiver found"
+    } else {
+        if (Prompt-YesNo "Open AIS-catcher download page? (AIS ship tracking)") {
+            Start-Process "https://github.com/jvde-github/AIS-catcher/releases"
+        } else {
+            Write-Warn "Skipped AIS-catcher (optional)"
+        }
+    }
+
     Write-Host ""
 }
 
@@ -274,7 +296,9 @@ function Print-Summary {
         @("dump1090",    "ADS-B decoder"),
         @("rtl_433",     "ISM band decoder"),
         @("satdump",     "Satellite decoder"),
-        @("multimon-ng", "POCSAG decoder")
+        @("multimon-ng", "POCSAG decoder"),
+        @("rtl_fm",      "FM demodulator for POCSAG"),
+        @("AIS-catcher", "AIS receiver")
     )
 
     foreach ($tool in $tools) {

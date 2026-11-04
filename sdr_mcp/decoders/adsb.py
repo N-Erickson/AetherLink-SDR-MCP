@@ -4,6 +4,8 @@ ADS-B aircraft state tracking and pyModeS decoding.
 
 import json
 import logging
+import math
+import time
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -36,8 +38,32 @@ class Aircraft:
     aircraft_type: Optional[str] = None
     operator: Optional[str] = None
     icao_type: Optional[str] = None
+    position_time: Optional[datetime] = None
+    distance_km: Optional[float] = None   # from the receiver, when its location is known
+    bearing_deg: Optional[float] = None
+    on_ground: Optional[bool] = None
     last_seen: Optional[datetime] = None
     message_count: int = 0
+
+
+CPR_PAIR_MAX_AGE_S = 10.0  # even/odd frames must be this close to solve a global position
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = p2 - p1
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def initial_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlmb = math.radians(lon2 - lon1)
+    x = math.sin(dlmb) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlmb)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
 
 
 class ADSBDecoder:
@@ -48,6 +74,62 @@ class ADSBDecoder:
         self.registration_cache: Dict[str, Dict[str, Any]] = {}
         self.raw_message_count = 0
         self.message_count = 0
+        self.position_count = 0
+        self.receiver_lat: Optional[float] = None
+        self.receiver_lon: Optional[float] = None
+        # Latest even/odd CPR frames per aircraft: icao -> {"even": (hex, t), "odd": (hex, t)}
+        self._cpr: Dict[str, Dict[str, Any]] = {}
+
+    def set_receiver_location(self, latitude: Optional[float], longitude: Optional[float]):
+        """Receiver position enables single-frame (local CPR) and surface position decoding."""
+        if latitude is None or longitude is None:
+            self.receiver_lat = self.receiver_lon = None
+            return
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            raise ValueError("Receiver latitude/longitude out of range")
+        self.receiver_lat = float(latitude)
+        self.receiver_lon = float(longitude)
+
+    def _update_position(self, aircraft: Aircraft, msg_hex: str, tc: int):
+        """Decode an airborne or surface position from CPR-encoded frames."""
+        if pms is None:
+            return
+        try:
+            oe = pms.adsb.oe_flag(msg_hex)
+        except Exception:
+            return
+        now = time.time()
+        frames = self._cpr.setdefault(aircraft.icao, {})
+        frames["odd" if oe else "even"] = (msg_hex, now)
+
+        position = None
+        airborne = 9 <= tc <= 18 or 20 <= tc <= 22
+        try:
+            if airborne:
+                even, odd = frames.get("even"), frames.get("odd")
+                if even and odd and abs(even[1] - odd[1]) <= CPR_PAIR_MAX_AGE_S:
+                    position = pms.adsb.position(even[0], odd[0], even[1], odd[1])
+                if position is None and self.receiver_lat is not None:
+                    position = pms.adsb.position_with_ref(msg_hex, self.receiver_lat, self.receiver_lon)
+            elif 5 <= tc <= 8 and self.receiver_lat is not None:
+                position = pms.adsb.surface_position_with_ref(msg_hex, self.receiver_lat, self.receiver_lon)
+        except Exception as e:
+            logger.debug(f"CPR decode failed for {aircraft.icao}: {e}")
+            position = None
+
+        if not position:
+            return
+        lat, lon = position
+        if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return
+        aircraft.latitude = round(float(lat), 5)
+        aircraft.longitude = round(float(lon), 5)
+        aircraft.position_time = datetime.now()
+        aircraft.on_ground = not airborne
+        self.position_count += 1
+        if self.receiver_lat is not None:
+            aircraft.distance_km = round(haversine_km(self.receiver_lat, self.receiver_lon, lat, lon), 1)
+            aircraft.bearing_deg = round(initial_bearing_deg(self.receiver_lat, self.receiver_lon, lat, lon))
 
     def decode_message(self, msg_hex: str) -> Optional[Dict[str, Any]]:
         """Decode a single ADS-B message from a hex string."""
@@ -90,14 +172,15 @@ class ADSBDecoder:
                 if callsign:
                     aircraft.callsign = str(callsign).strip().replace("_", "")
 
+            elif isinstance(tc, int) and 5 <= tc <= 8:
+                # Surface position (needs the receiver location as CPR reference)
+                self._update_position(aircraft, msg_hex, tc)
+
             elif isinstance(tc, int) and 9 <= tc <= 18:
                 alt = decoded.get("altitude")
                 if alt is not None:
                     aircraft.altitude = alt
-                if decoded.get("latitude") is not None:
-                    aircraft.latitude = decoded["latitude"]
-                if decoded.get("longitude") is not None:
-                    aircraft.longitude = decoded["longitude"]
+                self._update_position(aircraft, msg_hex, tc)
 
             elif tc == 19:
                 speed = decoded.get("groundspeed")
@@ -201,7 +284,11 @@ class ADSBDecoder:
                 data["tracking_url"] = self.get_tracking_url(icao)
                 active_aircraft.append(data)
 
-        active_aircraft.sort(key=lambda ac: ac.get("message_count", 0), reverse=True)
+        if self.receiver_lat is not None:
+            # Nearest first when we know where we are; unknown positions last
+            active_aircraft.sort(key=lambda ac: (ac.get("distance_km") is None, ac.get("distance_km") or 0))
+        else:
+            active_aircraft.sort(key=lambda ac: ac.get("message_count", 0), reverse=True)
         return active_aircraft
 
     def get_tracking_url(self, icao: str) -> str:
@@ -244,6 +331,11 @@ class ADSBDecoder:
             "active_aircraft": len(active),
             "identified_callsigns": sum(1 for ac in active if ac.get("callsign")),
             "with_altitude": sum(1 for ac in active if ac.get("altitude")),
+            "with_position": sum(1 for ac in active if ac.get("latitude") is not None),
+            "positions_decoded": self.position_count,
+            "receiver_location": (
+                [self.receiver_lat, self.receiver_lon] if self.receiver_lat is not None else None
+            ),
             "climbing": sum(1 for ac in active if (ac.get("vertical_rate") or 0) > 200),
             "descending": sum(1 for ac in active if (ac.get("vertical_rate") or 0) < -200),
         }

@@ -15,6 +15,8 @@ from datetime import datetime
 from collections import deque
 from pathlib import Path
 
+from ..utils.paths import recordings_dir
+
 @dataclass
 class Signal:
     """Detected signal information"""
@@ -292,13 +294,14 @@ class SignalRecorder:
     """Record IQ samples and spectrum data"""
 
     def __init__(self, base_path: str = None):
-        # Use /tmp/sdr_recordings as default - always writable
-        if base_path is None:
-            base_path = "/tmp/sdr_recordings"
-        self.base_path = base_path
+        self.base_path = base_path or recordings_dir()
         self.current_recording = None
         self.recording_metadata = {}
-        
+
+    @property
+    def is_recording(self) -> bool:
+        return self.current_recording is not None
+
     async def start_recording(self, 
                             center_freq: float,
                             sample_rate: float,
@@ -320,11 +323,11 @@ class SignalRecorder:
 
         # Create recording file
         os.makedirs(self.base_path, exist_ok=True)
-        self.current_recording = open(
-            f"{self.base_path}/{recording_id}.iq", 
-            "wb"
-        )
-        
+        file_path = os.path.join(self.base_path, f"{recording_id}.iq")
+        self.recording_metadata["file"] = file_path
+        self.recording_metadata["format"] = "complex float32, interleaved I/Q"
+        self.current_recording = open(file_path, "wb")
+
         return recording_id
         
     async def add_samples(self, samples: np.ndarray):
@@ -363,7 +366,9 @@ class SignalRecorder:
 
 class FrequencyScanner:
     """Scan frequency ranges for signals"""
-    
+
+    MAX_SCAN_POINTS = 2000
+
     def __init__(self, analyzer: SpectrumAnalyzer):
         self.analyzer = analyzer
         self.scan_results = []
@@ -375,8 +380,29 @@ class FrequencyScanner:
                         step: float,
                         dwell_time: float = 0.1) -> List[Dict[str, Any]]:
         """Scan a frequency range"""
+        if step <= 0:
+            raise ValueError("Scan step must be greater than 0 Hz")
+        if stop_freq <= start_freq:
+            raise ValueError("Scan stop frequency must be greater than the start frequency")
+        if not (0.01 <= dwell_time <= 5.0):
+            raise ValueError("Dwell time must be between 0.01 and 5 seconds")
+        points = int((stop_freq - start_freq) // step) + 1
+        if points > self.MAX_SCAN_POINTS:
+            raise ValueError(
+                f"Scan would visit {points} frequencies (max {self.MAX_SCAN_POINTS}). "
+                "Increase the step or narrow the range."
+            )
+        for bound in (start_freq, stop_freq):
+            if hasattr(sdr_device, "min_frequency") and not (
+                sdr_device.min_frequency <= bound <= sdr_device.max_frequency
+            ):
+                raise ValueError(
+                    f"Frequency {bound/1e6:.3f} MHz is outside the device range "
+                    f"({sdr_device.min_frequency/1e6:.1f}-{sdr_device.max_frequency/1e6:.1f} MHz)"
+                )
+
         self.scan_results = []
-        
+
         current_freq = start_freq
         while current_freq <= stop_freq:
             # Tune to frequency
@@ -452,103 +478,123 @@ class FrequencyScanner:
         return strongest
 
 class AudioRecorder:
-    """Record demodulated audio from FM/AM signals"""
+    """Record demodulated audio from FM/AM signals.
+
+    All filtering is done with stateful vectorised scipy filters so that each
+    chunk continues seamlessly from the previous one and processing stays far
+    below real time (the previous pure-Python loops ran slower than real time
+    at 2.048 Msps, which caused dropped samples and choppy audio).
+    """
+
+    FM_DEVIATION_HZ = 75e3   # broadcast FM peak deviation, used for scaling
+    AUDIO_CUTOFF_HZ = {"FM": 15e3, "AM": 10e3}  # mono audio bandwidth; keeps the 19 kHz stereo pilot out
 
     def __init__(self, base_path: str = None):
-        # Use /tmp/sdr_recordings as default - always writable
-        if base_path is None:
-            base_path = "/tmp/sdr_recordings"
-        self.base_path = base_path
+        self.base_path = base_path or recordings_dir()
         self.current_recording = None
         self.recording_metadata = {}
-        self.audio_rate = 48000  # Standard audio sample rate
-
-        # For smooth audio - track previous samples for continuity
-        self.last_phase = 0.0
-        self.dc_filter_state = 0.0
+        self.audio_rate = 48000      # target audio sample rate
+        self.output_rate = 48000     # actual rate written (sample_rate / integer decimation)
 
         # AGC (Automatic Gain Control) instead of per-chunk normalization
         self.agc_gain = 0.1
         self.agc_target = 0.3  # Target RMS level (leave headroom)
 
+        # Cross-chunk filter state
+        self._last_sample = None      # last IQ sample of the previous chunk (FM continuity)
+        self._decimation = 1
+        self._decim_phase = 0
+        self._aa_sos = None           # anti-alias filter (second-order sections)
+        self._aa_zi = None
+        self._dc_zi = None            # AM DC-block state
+        self._deemph_zi = None        # FM de-emphasis state
+        self._input_rate = None
+        self._modulation = "FM"
+
+    @property
+    def is_recording(self) -> bool:
+        return self.current_recording is not None
+
+    # ------------------------------------------------------------ DSP stages
+
+    def _configure(self, sample_rate: float, modulation: str = "FM"):
+        """Set up decimation and the audio low-pass filter for the given input rate."""
+        self._input_rate = sample_rate
+        self._modulation = modulation.upper()
+        self._decimation = max(1, int(round(sample_rate / self.audio_rate)))
+        self.output_rate = int(round(sample_rate / self._decimation))
+        audio_bw = self.AUDIO_CUTOFF_HZ.get(self._modulation, 15e3)
+        cutoff = min(audio_bw, 0.45 * self.output_rate, 0.45 * sample_rate)
+        self._aa_sos = signal.butter(8, cutoff, btype="low", fs=sample_rate, output="sos")
+        self._aa_zi = signal.sosfilt_zi(self._aa_sos) * 0.0
+        self._decim_phase = 0
+        self._last_sample = None
+        self._dc_zi = None
+        self._deemph_zi = None
+
     def _fm_demodulate(self, samples: np.ndarray) -> np.ndarray:
-        """FM demodulation using phase difference with continuity"""
-        # Calculate instantaneous phase
-        phase = np.unwrap(np.angle(samples))
+        """FM discriminator: phase of the conjugate product of consecutive samples.
 
-        # Use last phase from previous chunk for continuity
-        if self.last_phase != 0.0:
-            # Adjust phase to be continuous with previous chunk
-            phase_offset = self.last_phase - phase[0]
-            phase = phase + phase_offset
-
-        # Store last phase for next chunk
-        self.last_phase = phase[-1]
-
-        # Phase difference (derivative) - this is the demodulated signal
-        phase_diff = np.diff(phase)
-
-        # Pad to maintain same length
-        phase_diff = np.append(phase_diff, phase_diff[-1])
-
-        return phase_diff
+        Carrying the last sample across chunks keeps the output continuous
+        without any phase unwrapping.
+        """
+        if self._last_sample is None:
+            prev = samples[0]
+        else:
+            prev = self._last_sample
+        self._last_sample = samples[-1]
+        shifted = np.concatenate(([prev], samples[:-1]))
+        phase_diff = np.angle(samples * np.conj(shifted))
+        # Scale so full deviation maps to roughly +/-1
+        rate = self._input_rate or self.audio_rate
+        return phase_diff * (rate / (2 * np.pi * self.FM_DEVIATION_HZ))
 
     def _am_demodulate(self, samples: np.ndarray) -> np.ndarray:
-        """AM demodulation using envelope detection with DC filter"""
-        # Calculate envelope (magnitude)
-        envelope = np.abs(samples)
-
-        # High-pass filter to remove DC (continuous across chunks)
-        alpha = 0.95  # Filter coefficient
-        filtered = np.zeros_like(envelope)
-        filtered[0] = envelope[0] - self.dc_filter_state
-
-        for i in range(1, len(envelope)):
-            filtered[i] = alpha * (filtered[i-1] + envelope[i] - envelope[i-1])
-
-        self.dc_filter_state = envelope[-1]
-
+        """AM envelope detection with a stateful single-pole DC blocker."""
+        envelope = np.abs(samples).astype(np.float64)
+        alpha = 0.999  # DC block pole close to 1 at the input rate
+        b = [1.0, -1.0]
+        a = [1.0, -alpha]
+        if self._dc_zi is None:
+            self._dc_zi = signal.lfilter_zi(b, a) * envelope[0]
+        filtered, self._dc_zi = signal.lfilter(b, a, envelope, zi=self._dc_zi)
         return filtered
 
-    def _resample(self, audio: np.ndarray,
-                  original_rate: float,
-                  target_rate: float) -> np.ndarray:
-        """Resample audio to target rate using polyphase filtering"""
+    def _decimate(self, audio: np.ndarray) -> np.ndarray:
+        """Anti-alias filter then integer decimation, both continuous across chunks."""
+        if self._aa_sos is None:
+            self._configure(self._input_rate or self.audio_rate)
+        filtered, self._aa_zi = signal.sosfilt(self._aa_sos, audio, zi=self._aa_zi)
+        if self._decimation == 1:
+            return filtered
+        idx = np.arange(self._decim_phase, len(filtered), self._decimation)
+        if len(idx):
+            self._decim_phase = int(idx[-1] + self._decimation - len(filtered))
+        else:
+            self._decim_phase -= len(filtered)
+        return filtered[idx]
+
+    def _apply_deemphasis(self, audio: np.ndarray, sample_rate: float,
+                          tau: float = 75e-6) -> np.ndarray:
+        """FM de-emphasis (75us US / 50us EU) as a stateful single-pole IIR filter."""
+        x = np.exp(-1.0 / (sample_rate * tau))
+        b = [1.0 - x]
+        a = [1.0, -x]
+        if self._deemph_zi is None:
+            self._deemph_zi = signal.lfilter_zi(b, a) * (audio[0] if len(audio) else 0.0)
+        out, self._deemph_zi = signal.lfilter(b, a, audio, zi=self._deemph_zi)
+        return out
+
+    def _resample(self, audio: np.ndarray, original_rate: float, target_rate: float) -> np.ndarray:
+        """One-shot polyphase resampler for offline use (not used in the live path)."""
         if original_rate == target_rate:
             return audio
-
-        # Use scipy's resample_poly for better quality (less artifacts)
-        from scipy.signal import resample_poly
-
-        # Find greatest common divisor for efficient resampling
         from math import gcd
-        ratio_num = int(target_rate)
-        ratio_den = int(original_rate)
-        common = gcd(ratio_num, ratio_den)
-        up = ratio_num // common
-        down = ratio_den // common
+        from scipy.signal import resample_poly
+        common = gcd(int(target_rate), int(original_rate))
+        return resample_poly(audio, int(target_rate) // common, int(original_rate) // common)
 
-        # Resample using polyphase filtering
-        return resample_poly(audio, up, down)
-
-    def _apply_deemphasis(self, audio: np.ndarray,
-                          sample_rate: float,
-                          tau: float = 75e-6) -> np.ndarray:
-        """Apply FM de-emphasis filter (75μs for US, 50μs for EU)"""
-        # De-emphasis filter time constant
-        # H(s) = 1 / (1 + s*tau)
-
-        d = sample_rate * tau
-        x = np.exp(-1.0 / d)
-
-        # Simple IIR filter
-        output = np.zeros_like(audio)
-        output[0] = audio[0]
-
-        for i in range(1, len(audio)):
-            output[i] = audio[i] * (1 - x) + output[i-1] * x
-
-        return output
+    # ------------------------------------------------------------ recording
 
     async def start_recording(self,
                               center_freq: float,
@@ -557,35 +603,61 @@ class AudioRecorder:
                               description: str = "") -> str:
         """Start a new audio recording"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        modulation = modulation.upper()
         recording_id = f"audio_{timestamp}_{int(center_freq/1e6)}MHz_{modulation}"
 
-        # Reset state variables for new recording
-        self.last_phase = 0.0
-        self.dc_filter_state = 0.0
+        # Reset DSP state for the new recording
+        self._configure(sample_rate, modulation)
         self.agc_gain = 0.1
+
+        os.makedirs(self.base_path, exist_ok=True)
+        wav_path = os.path.join(self.base_path, f"{recording_id}.wav")
 
         self.recording_metadata = {
             "id": recording_id,
+            "file": wav_path,
             "start_time": datetime.now().isoformat(),
             "center_freq": center_freq,
             "sample_rate": sample_rate,
-            "modulation": modulation.upper(),
+            "modulation": modulation,
             "description": description,
-            "audio_rate": self.audio_rate,
+            "audio_rate": self.output_rate,
             "samples_recorded": 0
         }
 
-        # Create recording directory
-        os.makedirs(self.base_path, exist_ok=True)
-
-        # Create WAV file
-        wav_path = f"{self.base_path}/{recording_id}.wav"
         self.current_recording = wave.open(wav_path, 'wb')
         self.current_recording.setnchannels(1)  # Mono
         self.current_recording.setsampwidth(2)  # 16-bit
-        self.current_recording.setframerate(self.audio_rate)
+        self.current_recording.setframerate(self.output_rate)
 
         return recording_id
+
+    def process_chunk(self, samples: np.ndarray, sample_rate: float,
+                      modulation: str = "FM") -> np.ndarray:
+        """Demodulate one IQ chunk to int16 audio at output_rate."""
+        if self._input_rate != sample_rate or self._aa_sos is None or self._modulation != modulation.upper():
+            self._configure(sample_rate, modulation)
+
+        if modulation.upper() == "AM":
+            audio = self._am_demodulate(samples)
+            audio = self._decimate(audio)
+        else:
+            audio = self._fm_demodulate(samples)
+            audio = self._decimate(audio)
+            audio = self._apply_deemphasis(audio, self.output_rate)
+
+        if len(audio) == 0:
+            return np.zeros(0, dtype=np.int16)
+
+        # AGC for smooth volume
+        rms = np.sqrt(np.mean(audio ** 2))
+        if rms > 0:
+            target_gain = self.agc_target / rms
+            self.agc_gain = 0.9 * self.agc_gain + 0.1 * target_gain
+            self.agc_gain = min(self.agc_gain, 10.0)
+        audio = np.tanh(audio * self.agc_gain)  # soft clip
+
+        return (audio * 32767 * 0.9).astype(np.int16)
 
     async def add_samples(self, samples: np.ndarray,
                          sample_rate: float,
@@ -593,46 +665,10 @@ class AudioRecorder:
         """Demodulate and add audio samples to recording"""
         if not self.current_recording:
             return
-
-        # Demodulate based on type
-        if modulation.upper() == "FM":
-            audio = self._fm_demodulate(samples)
-            # Apply de-emphasis for FM broadcast
-            audio = self._apply_deemphasis(audio, sample_rate)
-        elif modulation.upper() == "AM":
-            audio = self._am_demodulate(samples)
-        else:
-            # Default to FM
-            audio = self._fm_demodulate(samples)
-
-        # Resample to audio rate
-        audio = self._resample(audio, sample_rate, self.audio_rate)
-
-        # Apply AGC (Automatic Gain Control) for smooth volume
-        if len(audio) > 0:
-            # Calculate RMS level
-            rms = np.sqrt(np.mean(audio ** 2))
-
-            # Update gain smoothly
-            if rms > 0:
-                target_gain = self.agc_target / rms
-                # Smooth gain changes to avoid artifacts
-                self.agc_gain = 0.9 * self.agc_gain + 0.1 * target_gain
-                # Limit gain to prevent excessive amplification
-                self.agc_gain = min(self.agc_gain, 10.0)
-
-            # Apply gain
-            audio = audio * self.agc_gain
-
-            # Soft clipping to prevent hard clipping artifacts
-            audio = np.tanh(audio)
-
-        # Convert to 16-bit PCM
-        audio_int16 = (audio * 32767 * 0.9).astype(np.int16)  # 0.9 for headroom
-
-        # Write to WAV file
-        self.current_recording.writeframes(audio_int16.tobytes())
-        self.recording_metadata["samples_recorded"] += len(audio_int16)
+        audio_int16 = self.process_chunk(samples, sample_rate, modulation)
+        if len(audio_int16):
+            self.current_recording.writeframes(audio_int16.tobytes())
+            self.recording_metadata["samples_recorded"] += len(audio_int16)
 
     async def stop_recording(self) -> Dict[str, Any]:
         """Stop current audio recording"""
@@ -640,15 +676,16 @@ class AudioRecorder:
             self.current_recording.close()
             self.current_recording = None
 
-            # Save metadata
             self.recording_metadata["end_time"] = datetime.now().isoformat()
             self.recording_metadata["duration"] = (
                 datetime.fromisoformat(self.recording_metadata["end_time"]) -
                 datetime.fromisoformat(self.recording_metadata["start_time"])
             ).total_seconds()
+            self.recording_metadata["audio_seconds"] = (
+                self.recording_metadata["samples_recorded"] / self.output_rate
+            )
 
-            # Write metadata file
-            metadata_file = f"{self.base_path}/{self.recording_metadata['id']}.json"
+            metadata_file = os.path.join(self.base_path, f"{self.recording_metadata['id']}.json")
             with open(metadata_file, "w") as f:
                 json.dump(self.recording_metadata, f, indent=2)
 

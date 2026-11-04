@@ -99,6 +99,6 @@ jobs:
         from sdr_mcp.analysis.spectrum import AudioRecorder
         recorder = AudioRecorder()
         assert recorder.audio_rate == 48000
-        assert recorder.base_path == '/tmp/sdr_recordings'
+        import os; assert os.path.isabs(recorder.base_path) and recorder.base_path.endswith(os.path.join('AetherLink', 'recordings'))
         print('AudioRecorder initializes')
         "

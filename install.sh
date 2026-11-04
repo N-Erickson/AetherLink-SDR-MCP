@@ -181,6 +181,12 @@ install_system_deps() {
 
     # dump1090
     install_dump1090
+
+    # AIS receiver
+    install_ais_receiver
+
+    # HackRF host library (optional hardware)
+    install_hackrf_lib
 }
 
 setup_linux_udev() {
@@ -341,6 +347,68 @@ install_dump1090() {
     esac
 }
 
+install_ais_receiver() {
+    if command -v AIS-catcher &>/dev/null || command -v rtl_ais &>/dev/null; then
+        ok "AIS receiver already installed"
+        return
+    fi
+
+    if ! prompt_yn "Install rtl_ais (AIS ship tracking)?"; then
+        warn "Skipped AIS receiver"
+        return
+    fi
+
+    # Debian/Ubuntu package it; everywhere else build rtl-ais from source
+    if [ "$PKG_MGR" = "apt" ]; then
+        if sudo apt-get install -y -qq rtl-ais 2>/dev/null && command -v rtl_ais &>/dev/null; then
+            ok "rtl_ais installed"
+            return
+        fi
+        info "rtl-ais package not available, building from source..."
+    fi
+
+    case "$PKG_MGR" in
+        brew)   brew list pkg-config &>/dev/null || brew install pkg-config; brew list libusb &>/dev/null || brew install libusb ;;
+        apt)    sudo apt-get install -y -qq build-essential pkg-config libusb-1.0-0-dev librtlsdr-dev 2>/dev/null || true ;;
+        dnf)    sudo dnf install -y -q gcc make pkgconf-pkg-config libusb1-devel rtl-sdr-devel 2>/dev/null || true ;;
+        pacman) sudo pacman -S --noconfirm --needed base-devel pkgconf libusb rtl-sdr 2>/dev/null || true ;;
+    esac
+
+    local build_dir
+    build_dir=$(mktemp -d)
+    if git clone --depth 1 https://github.com/dgiardini/rtl-ais.git "$build_dir/rtl-ais" 2>/dev/null; then
+        if (cd "$build_dir/rtl-ais" && make 2>&1 | tail -2) && [ -f "$build_dir/rtl-ais/rtl_ais" ]; then
+            sudo cp "$build_dir/rtl-ais/rtl_ais" /usr/local/bin/
+            ok "rtl_ais installed to /usr/local/bin/"
+        else
+            warn "rtl_ais build failed. Alternative: AIS-catcher, https://github.com/jvde-github/AIS-catcher"
+        fi
+    else
+        warn "Failed to clone rtl-ais repository"
+    fi
+    rm -rf "$build_dir"
+}
+
+install_hackrf_lib() {
+    if command -v hackrf_info &>/dev/null; then
+        ok "HackRF tools already installed"
+        return
+    fi
+
+    if ! prompt_yn "Install HackRF host library (only needed for HackRF One hardware)?"; then
+        warn "Skipped HackRF library"
+        return
+    fi
+
+    case "$PKG_MGR" in
+        brew)   brew install hackrf && ok "HackRF library installed" || warn "HackRF install failed" ;;
+        apt)    sudo apt-get install -y -qq hackrf libhackrf-dev && ok "HackRF library installed" || warn "HackRF install failed" ;;
+        dnf)    sudo dnf install -y -q hackrf && ok "HackRF library installed" || warn "HackRF install failed" ;;
+        pacman) sudo pacman -S --noconfirm --needed hackrf && ok "HackRF library installed" || warn "HackRF install failed" ;;
+        *)      warn "Install libhackrf manually: https://github.com/greatscottgadgets/hackrf" ;;
+    esac
+}
+
 # ─── Install AetherLink Python package ────────────────────────────────────────
 
 install_aetherlink() {
@@ -431,6 +499,13 @@ print_summary() {
     check_tool rtl_433     "ISM band decoder"
     check_tool satdump     "Satellite decoder"
     check_tool multimon-ng "POCSAG decoder"
+    check_tool rtl_fm      "FM demodulator for POCSAG"
+    if command -v AIS-catcher &>/dev/null; then
+        check_tool AIS-catcher "AIS receiver"
+    else
+        check_tool rtl_ais     "AIS receiver"
+    fi
+    check_tool hackrf_info "HackRF library (optional)"
     echo ""
     echo "  Next steps:"
     echo "    1. Plug in your RTL-SDR or HackRF"

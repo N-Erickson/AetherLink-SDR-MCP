@@ -1,19 +1,42 @@
 """
-AIS (Automatic Identification System) Ship Tracking Decoder
-Decodes AIS messages on 161.975 MHz and 162.025 MHz
+AIS (Automatic Identification System) vessel tracking decoder.
+
+Live reception is done by an external receiver (AIS-catcher or rtl_ais) that
+emits NMEA 0183 ``!AIVDM`` sentences on 161.975 / 162.025 MHz. This module
+assembles multi-part sentences, decodes them with pyais and keeps a vessel table.
 """
 
-import numpy as np
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
-from datetime import datetime
 import logging
+import re
+from collections import deque
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from typing import Any, Deque, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+try:
+    from pyais import decode as pyais_decode
+    AIS_AVAILABLE = True
+except ImportError:
+    pyais_decode = None
+    AIS_AVAILABLE = False
+    logger.warning("AIS decoder not available. Install with: pip install pyais")
 
 # AIS constants
 AIS_CHANNEL_A = 161.975e6
 AIS_CHANNEL_B = 162.025e6
+
+# Matches a VDM/VDO sentence embedded anywhere in a line (receivers add prefixes/suffixes)
+NMEA_RE = re.compile(r"(![A-Z]{2}VD[MO],[^\s]*)")
+
+# Sentinel values meaning "not available" in AIS messages
+LAT_UNAVAILABLE = 91.0
+LON_UNAVAILABLE = 181.0
+SPEED_UNAVAILABLE = 102.3
+COURSE_UNAVAILABLE = 360.0
+HEADING_UNAVAILABLE = 511
+
 
 @dataclass
 class AISVessel:
@@ -23,185 +46,192 @@ class AISVessel:
     callsign: Optional[str] = None
     imo: Optional[int] = None
     ship_type: Optional[str] = None
+    nav_status: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    speed: Optional[float] = None  # knots
-    course: Optional[float] = None  # degrees
+    speed: Optional[float] = None    # knots
+    course: Optional[float] = None   # degrees
     heading: Optional[float] = None  # degrees
     destination: Optional[str] = None
-    eta: Optional[str] = None
-    last_seen: datetime = None
+    last_seen: Optional[datetime] = None
     message_count: int = 0
 
+    @property
+    def tracking_url(self) -> str:
+        return f"https://www.marinetraffic.com/en/ais/details/ships/mmsi:{self.mmsi}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["last_seen"] = self.last_seen.isoformat() if self.last_seen else None
+        data["tracking_url"] = self.tracking_url
+        return data
+
+
+def _enum_name(value: Any) -> Optional[str]:
+    """pyais returns enums for ship type / nav status; store a readable string."""
+    if value is None:
+        return None
+    name = getattr(value, "name", None)
+    if name:
+        # UnderWayUsingEngine -> Under Way Using Engine
+        return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+    return str(value)
+
+
+def _clean_text(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value).replace("@", " ").strip()
+    return text or None
+
+
 class AISDecoder:
-    """AIS protocol decoder"""
+    """AIS NMEA assembler, pyais decoder, and vessel tracker"""
 
-    # AIS ship types
-    SHIP_TYPES = {
-        30: "Fishing",
-        31: "Towing",
-        32: "Towing (large)",
-        33: "Dredging",
-        34: "Diving",
-        35: "Military",
-        36: "Sailing",
-        37: "Pleasure craft",
-        40: "High speed craft",
-        41: "High speed craft (hazardous)",
-        42: "High speed craft (medical)",
-        50: "Pilot vessel",
-        51: "SAR",
-        52: "Tug",
-        53: "Port tender",
-        54: "Anti-pollution",
-        55: "Law enforcement",
-        60: "Passenger",
-        70: "Cargo",
-        80: "Tanker",
-        90: "Other"
-    }
-
-    def __init__(self):
+    def __init__(self, max_age_seconds: int = 600):
         self.vessels: Dict[str, AISVessel] = {}
-        self.message_count = 0
+        self.max_age_seconds = max_age_seconds
+        self.message_count = 0     # successfully decoded AIS messages
+        self.nmea_count = 0        # NMEA sentences seen
+        self.decode_errors = 0
+        self.recent_nmea: Deque[str] = deque(maxlen=200)
+        self._pending: Dict[str, Dict[int, str]] = {}
 
-    def decode_sixbit(self, data: str) -> str:
-        """Decode AIS 6-bit ASCII payload"""
-        result = []
-        for char in data:
-            val = ord(char) - 48
-            if val > 40:
-                val -= 8
-            result.append(chr(val + 32) if 32 <= val + 32 <= 95 else '?')
-        return ''.join(result).strip('@')
+    # ------------------------------------------------------------ ingest
 
-    def decode_position_report(self, mmsi: str, payload: bytes) -> Optional[Dict[str, Any]]:
-        """Decode AIS position report (message types 1, 2, 3)"""
-        if len(payload) < 17:
-            logger.debug(f"AIS position report payload too short: {len(payload)} bytes")
+    def feed_line(self, line: str) -> Optional[Dict[str, Any]]:
+        """Feed one line of receiver output. Returns decoded message info when complete."""
+        match = NMEA_RE.search(line)
+        if not match:
+            return None
+        sentence = match.group(1)
+        self.nmea_count += 1
+        self.recent_nmea.append(sentence)
+
+        fields = sentence.split("*")[0].split(",")
+        if len(fields) < 6:
+            return None
+        try:
+            total = int(fields[1])
+            index = int(fields[2])
+        except ValueError:
             return None
 
-        # Extract fields from payload
-        # This is a simplified decoder - real AIS needs proper bit extraction
+        if total <= 1:
+            return self._decode([sentence])
 
-        # Latitude/Longitude (28 bits each, in 1/10000 minute)
-        lat_raw = int.from_bytes(payload[8:12], 'big') & 0x7FFFFFF
-        lon_raw = int.from_bytes(payload[12:16], 'big') & 0xFFFFFFF
-
-        latitude = (lat_raw / 600000.0) if lat_raw != 0x3412140 else None
-        longitude = (lon_raw / 600000.0) if lon_raw != 0x6791AC0 else None
-
-        # Speed over ground (10 bits, in 1/10 knot)
-        speed_raw = (int.from_bytes(payload[6:8], 'big') >> 6) & 0x3FF
-        speed = speed_raw / 10.0 if speed_raw != 1023 else None
-
-        # Course over ground (12 bits, in 1/10 degree)
-        course_raw = int.from_bytes(payload[7:9], 'big') & 0xFFF
-        course = course_raw / 10.0 if course_raw != 3600 else None
-
-        # True heading (9 bits)
-        heading_raw = (int.from_bytes(payload[9:11], 'big') >> 7) & 0x1FF
-        heading = float(heading_raw) if heading_raw != 511 else None
-
-        return {
-            'latitude': latitude,
-            'longitude': longitude,
-            'speed': speed,
-            'course': course,
-            'heading': heading
-        }
-
-    def decode_static_data(self, mmsi: str, payload: bytes) -> Optional[Dict[str, Any]]:
-        """Decode AIS static and voyage data (message type 5)"""
-        if len(payload) < 423:
-            logger.debug(f"AIS static data payload too short: {len(payload)} bytes")
+        # Multi-sentence message: group by channel + sequential id
+        key = f"{fields[4]}:{fields[3]}"
+        parts = self._pending.setdefault(key, {})
+        parts[index] = sentence
+        if len(parts) < total:
+            if len(self._pending) > 64:  # drop stale partial messages
+                self._pending.pop(next(iter(self._pending)))
             return None
-
-        # Extract vessel name (20 chars, 6-bit ASCII)
-        name_data = payload[20:140].decode('ascii', errors='ignore')
-        name = self.decode_sixbit(name_data) if name_data else None
-
-        # Callsign (7 chars)
-        callsign_data = payload[70:112].decode('ascii', errors='ignore')
-        callsign = self.decode_sixbit(callsign_data) if callsign_data else None
-
-        # Ship type
-        ship_type_code = payload[232:240]
-        ship_type = self.SHIP_TYPES.get(ship_type_code, f"Type {ship_type_code}")
-
-        # Destination (20 chars)
-        dest_data = payload[302:422].decode('ascii', errors='ignore')
-        destination = self.decode_sixbit(dest_data) if dest_data else None
-
-        return {
-            'name': name,
-            'callsign': callsign,
-            'ship_type': ship_type,
-            'destination': destination
-        }
-
-    def decode_message(self, payload: bytes) -> Optional[Dict[str, Any]]:
-        """Decode AIS message"""
-        if len(payload) < 6:
+        del self._pending[key]
+        if sorted(parts) != list(range(1, total + 1)):
             return None
+        return self._decode([parts[i] for i in range(1, total + 1)])
 
-        # Message type (6 bits)
-        msg_type = (payload[0] >> 2) & 0x3F
+    def _decode(self, sentences: List[str]) -> Optional[Dict[str, Any]]:
+        if not AIS_AVAILABLE:
+            return None
+        try:
+            message = pyais_decode(*[s.encode() for s in sentences])
+            data = message.asdict()
+        except Exception as e:
+            self.decode_errors += 1
+            logger.debug(f"AIS decode failed: {e} ({sentences[0][:40]}...)")
+            return None
+        return self._apply(data)
 
-        # MMSI (30 bits) - requires 6 bytes for extraction
-        mmsi_raw = ((payload[1] & 0x3) << 28) | (payload[2] << 20) | (payload[3] << 12) | (payload[4] << 4) | ((payload[5] >> 4) & 0xF)
-        mmsi = str(mmsi_raw)
+    def _apply(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        mmsi = data.get("mmsi")
+        if mmsi is None:
+            return None
+        mmsi = str(mmsi)
 
-        # Update or create vessel entry
-        if mmsi not in self.vessels:
-            self.vessels[mmsi] = AISVessel(mmsi=mmsi, last_seen=datetime.now())
-
-        vessel = self.vessels[mmsi]
+        vessel = self.vessels.get(mmsi)
+        if vessel is None:
+            vessel = AISVessel(mmsi=mmsi)
+            self.vessels[mmsi] = vessel
         vessel.last_seen = datetime.now()
         vessel.message_count += 1
         self.message_count += 1
 
-        # Decode based on message type
-        if msg_type in [1, 2, 3]:  # Position reports
-            pos_data = self.decode_position_report(mmsi, payload)
-            if pos_data:
-                vessel.latitude = pos_data.get('latitude')
-                vessel.longitude = pos_data.get('longitude')
-                vessel.speed = pos_data.get('speed')
-                vessel.course = pos_data.get('course')
-                vessel.heading = pos_data.get('heading')
+        lat = data.get("lat")
+        lon = data.get("lon")
+        if lat is not None and lon is not None and abs(lat) <= 90 and abs(lon) <= 180 \
+                and lat != LAT_UNAVAILABLE and lon != LON_UNAVAILABLE:
+            vessel.latitude = float(lat)
+            vessel.longitude = float(lon)
 
-        elif msg_type == 5:  # Static and voyage data
-            static_data = self.decode_static_data(mmsi, payload)
-            if static_data:
-                vessel.name = static_data.get('name')
-                vessel.callsign = static_data.get('callsign')
-                vessel.ship_type = static_data.get('ship_type')
-                vessel.destination = static_data.get('destination')
+        speed = data.get("speed")
+        if speed is not None and speed < SPEED_UNAVAILABLE:
+            vessel.speed = float(speed)
+        course = data.get("course")
+        if course is not None and course < COURSE_UNAVAILABLE:
+            vessel.course = float(course)
+        heading = data.get("heading")
+        if heading is not None and heading != HEADING_UNAVAILABLE:
+            vessel.heading = float(heading)
+
+        name = _clean_text(data.get("shipname") or data.get("name"))
+        if name:
+            vessel.name = name
+        callsign = _clean_text(data.get("callsign"))
+        if callsign:
+            vessel.callsign = callsign
+        destination = _clean_text(data.get("destination"))
+        if destination:
+            vessel.destination = destination
+        ship_type = _enum_name(data.get("ship_type"))
+        if ship_type:
+            vessel.ship_type = ship_type
+        nav_status = _enum_name(data.get("status"))
+        if nav_status:
+            vessel.nav_status = nav_status
+        imo = data.get("imo")
+        if imo:
+            vessel.imo = int(imo)
 
         return {
-            'mmsi': mmsi,
-            'message_type': msg_type,
-            'vessel': asdict(vessel)
+            "mmsi": mmsi,
+            "message_type": data.get("msg_type"),
+            "vessel": vessel.to_dict(),
         }
 
-    def get_vessel_list(self) -> List[Dict[str, Any]]:
-        """Get list of tracked vessels"""
+    # ------------------------------------------------------------ queries
+
+    def get_vessel_list(self, max_age_seconds: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Vessels seen within max_age_seconds, most recent first"""
+        max_age = max_age_seconds or self.max_age_seconds
         now = datetime.now()
-        active_vessels = []
+        active = []
+        for vessel in self.vessels.values():
+            if vessel.last_seen is None:
+                continue
+            age = (now - vessel.last_seen).total_seconds()
+            if age < max_age:
+                data = vessel.to_dict()
+                data["age_seconds"] = int(age)
+                active.append(data)
+        active.sort(key=lambda v: v["age_seconds"])
+        return active
 
-        for mmsi, vessel in self.vessels.items():
-            # Only include vessels seen in last 10 minutes
-            time_diff = (now - vessel.last_seen).total_seconds()
-            if time_diff < 600:
-                active_vessels.append(asdict(vessel))
-
-        return active_vessels
-
-    def get_statistics(self) -> Dict[str, Any]:
+    def get_statistics(self, max_age_seconds: Optional[int] = None) -> Dict[str, Any]:
         """Get decoder statistics"""
+        active = self.get_vessel_list(max_age_seconds)
         return {
             'total_messages': self.message_count,
+            'nmea_sentences': self.nmea_count,
+            'decode_errors': self.decode_errors,
             'total_vessels': len(self.vessels),
-            'active_vessels': len(self.get_vessel_list())
+            'active_vessels': len(active),
+            'with_position': sum(1 for v in active if v.get("latitude") is not None),
+            'with_name': sum(1 for v in active if v.get("name")),
         }
+
+    def clear(self):
+        self.vessels.clear()
+        self._pending.clear()

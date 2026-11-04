@@ -1,13 +1,18 @@
 """
 POCSAG Pager Decoder
-Decodes POCSAG 512/1200/2400 baud pager messages
+
+Live decoding is performed by multimon-ng fed from rtl_fm (see
+SDRMCPServer._pocsag_decoder_task). This module parses multimon-ng's text
+output into messages and keeps the message history. The codeword-level
+helpers at the bottom remain available for offline experiments.
 """
 
-import numpy as np
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
-from datetime import datetime
 import logging
+import re
+from collections import deque
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from typing import Any, Deque, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +20,17 @@ logger = logging.getLogger(__name__)
 POCSAG_SYNC = 0x7CD215D8
 POCSAG_IDLE = 0x7A89C197
 POCSAG_BATCH_SIZE = 16  # 16 codewords per batch
+POCSAG_BAUD_RATES = (512, 1200, 2400)
+
+# multimon-ng prints e.g.
+#   POCSAG1200: Address: 1234567  Function: 0  Alpha:   HELLO WORLD
+#   POCSAG512: Address:  123456  Function: 3  Numeric: 555-1234
+#   POCSAG2400: Address: 1234567  Function: 2
+MULTIMON_POCSAG_RE = re.compile(
+    r"^POCSAG(?P<baud>512|1200|2400):\s+Address:\s*(?P<address>\d+)\s+Function:\s*(?P<function>\d)"
+    r"(?:\s+(?P<kind>Alpha|Numeric|Skyper):\s*(?P<text>.*?))?\s*$"
+)
+
 
 @dataclass
 class POCSAGMessage:
@@ -25,163 +41,178 @@ class POCSAGMessage:
     timestamp: datetime
     bitrate: int
     numeric: bool
+    message_type: str = "alpha"  # alpha | numeric | tone
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["timestamp"] = self.timestamp.isoformat()
+        return data
+
 
 class POCSAGDecoder:
-    """POCSAG pager protocol decoder"""
+    """POCSAG pager protocol decoder (multimon-ng output parser + message store)"""
 
-    def __init__(self):
-        self.messages: List[POCSAGMessage] = []
+    def __init__(self, max_messages: int = 1000):
+        self.messages: Deque[POCSAGMessage] = deque(maxlen=max_messages)
         self.message_count = 0
+        self.lines_seen = 0
+        self.baud_rate: Optional[int] = None   # None = decode all rates
+        self.frequency: Optional[float] = None
+
+    # ------------------------------------------------------------ multimon-ng
+
+    def parse_multimon_line(self, line: str) -> Optional[POCSAGMessage]:
+        """Parse one line of multimon-ng output. Returns a message or None."""
+        self.lines_seen += 1
+        match = MULTIMON_POCSAG_RE.match(line.strip())
+        if not match:
+            return None
+
+        kind = match.group("kind")
+        text = (match.group("text") or "").strip()
+        if kind == "Numeric":
+            message_type = "numeric"
+        elif kind in ("Alpha", "Skyper"):
+            message_type = "alpha"
+        else:
+            message_type = "tone"
+
+        message = POCSAGMessage(
+            address=int(match.group("address")),
+            function=int(match.group("function")),
+            message=text,
+            timestamp=datetime.now(),
+            bitrate=int(match.group("baud")),
+            numeric=(message_type == "numeric"),
+            message_type=message_type,
+        )
+        self.messages.append(message)
+        self.message_count += 1
+        return message
+
+    # ------------------------------------------------------------ queries
+
+    def get_messages(self, max_age_seconds: Optional[int] = None,
+                     limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return stored messages, newest last, optionally filtered by age and count."""
+        now = datetime.now()
+        items = list(self.messages)
+        if max_age_seconds:
+            items = [m for m in items if (now - m.timestamp).total_seconds() < max_age_seconds]
+        if limit:
+            items = items[-limit:]
+        return [m.to_dict() for m in items]
+
+    def get_recent_messages(self, max_age_seconds: int = 300) -> List[Dict[str, Any]]:
+        """Get messages from the last N seconds"""
+        return self.get_messages(max_age_seconds=max_age_seconds)
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get decoder statistics"""
+        messages = list(self.messages)
+        return {
+            'total_messages': self.message_count,
+            'messages_stored': len(messages),
+            'addresses_seen': len({m.address for m in messages}),
+            'baud_rates_seen': sorted({m.bitrate for m in messages}),
+            'alpha_messages': sum(1 for m in messages if m.message_type == "alpha"),
+            'numeric_messages': sum(1 for m in messages if m.message_type == "numeric"),
+            'tone_only_pages': sum(1 for m in messages if m.message_type == "tone"),
+            'frequency_MHz': self.frequency / 1e6 if self.frequency else None,
+        }
+
+    def clear(self):
+        self.messages.clear()
+
+    # ------------------------------------------------------------ codeword helpers
 
     def decode_codeword(self, codeword: int) -> Optional[Dict[str, Any]]:
         """Decode a single POCSAG codeword"""
-        # Check parity
         if not self._check_parity(codeword):
             return None
 
-        # Bit 0 indicates address (0) or message (1)
+        # Bit 31 indicates address (0) or message (1)
         is_message = (codeword >> 31) & 1
 
         if is_message:
-            # Message codeword - extract 20 bits of data
             data = (codeword >> 11) & 0xFFFFF
             return {'type': 'message', 'data': data}
-        else:
-            # Address codeword
-            address = (codeword >> 13) & 0x3FFFF  # 18 bits
-            function = (codeword >> 11) & 0x3      # 2 bits
-            return {'type': 'address', 'address': address, 'function': function}
+        address = (codeword >> 13) & 0x3FFFF  # 18 bits
+        function = (codeword >> 11) & 0x3      # 2 bits
+        return {'type': 'address', 'address': address, 'function': function}
 
     def _check_parity(self, codeword: int) -> bool:
-        """Check BCH parity of codeword"""
-        # Simple parity check - count bits
+        """Even-parity check of a codeword (the final BCH parity bit)"""
         bits = bin(codeword).count('1')
         return (bits % 2) == 0
 
     def decode_message_data(self, data_words: List[int], numeric: bool = False) -> str:
         """Decode message data from multiple codewords"""
         if numeric:
-            # Numeric pager message (BCD encoding)
             return self._decode_numeric(data_words)
-        else:
-            # Alphanumeric message (7-bit ASCII)
-            return self._decode_alphanumeric(data_words)
+        return self._decode_alphanumeric(data_words)
 
     def _decode_numeric(self, data_words: List[int]) -> str:
-        """Decode numeric pager message"""
+        """Decode numeric pager message (BCD)"""
+        table = {0xA: '*', 0xB: 'U', 0xC: ' ', 0xD: '-', 0xE: '(', 0xF: ')'}
         result = []
         for word in data_words:
-            # Extract BCD digits (4 bits each)
             for i in range(5):  # 5 digits per 20-bit word
                 digit = (word >> (i * 4)) & 0xF
-                if digit < 10:
-                    result.append(str(digit))
-                elif digit == 0xA:
-                    result.append('*')
-                elif digit == 0xB:
-                    result.append('U')  # Urgency
-                elif digit == 0xC:
-                    result.append(' ')
-                elif digit == 0xD:
-                    result.append('-')
-                elif digit == 0xE:
-                    result.append('(')
-                elif digit == 0xF:
-                    result.append(')')
+                result.append(str(digit) if digit < 10 else table[digit])
         return ''.join(result).strip()
 
     def _decode_alphanumeric(self, data_words: List[int]) -> str:
         """Decode alphanumeric pager message (7-bit ASCII)"""
         bits = []
         for word in data_words:
-            # Extract 20 bits
             for i in range(20):
                 bits.append((word >> i) & 1)
 
-        # Convert to 7-bit ASCII characters
         result = []
         for i in range(0, len(bits) - 6, 7):
-            char_bits = bits[i:i+7]
+            char_bits = bits[i:i + 7]
             char_val = sum(bit << idx for idx, bit in enumerate(char_bits))
-            if 32 <= char_val <= 126:  # Printable ASCII
+            if 32 <= char_val <= 126:
                 result.append(chr(char_val))
-
         return ''.join(result).strip()
 
     def process_batch(self, codewords: List[int]) -> List[POCSAGMessage]:
-        """Process a batch of POCSAG codewords"""
+        """Process a batch of POCSAG codewords (offline helper)"""
         messages = []
         current_address = None
         current_function = None
-        message_words = []
+        message_words: List[int] = []
+
+        def flush():
+            if current_address is not None and message_words:
+                msg_text = self.decode_message_data(message_words, numeric=False)
+                if msg_text:
+                    message = POCSAGMessage(
+                        address=current_address,
+                        function=current_function,
+                        message=msg_text,
+                        timestamp=datetime.now(),
+                        bitrate=self.baud_rate or 1200,
+                        numeric=False,
+                    )
+                    messages.append(message)
+                    self.messages.append(message)
+                    self.message_count += 1
 
         for codeword in codewords:
             if codeword == POCSAG_IDLE:
                 continue
-
             decoded = self.decode_codeword(codeword)
             if not decoded:
                 continue
-
             if decoded['type'] == 'address':
-                # New message starting
-                if current_address is not None and message_words:
-                    # Save previous message
-                    msg_text = self.decode_message_data(message_words, numeric=False)
-                    if msg_text:
-                        message = POCSAGMessage(
-                            address=current_address,
-                            function=current_function,
-                            message=msg_text,
-                            timestamp=datetime.now(),
-                            bitrate=1200,  # Default
-                            numeric=False
-                        )
-                        messages.append(message)
-                        self.messages.append(message)
-                        self.message_count += 1
-
+                flush()
                 current_address = decoded['address']
                 current_function = decoded['function']
                 message_words = []
-
-            elif decoded['type'] == 'message':
+            else:
                 message_words.append(decoded['data'])
 
-        # Handle last message
-        if current_address is not None and message_words:
-            msg_text = self.decode_message_data(message_words, numeric=False)
-            if msg_text:
-                message = POCSAGMessage(
-                    address=current_address,
-                    function=current_function,
-                    message=msg_text,
-                    timestamp=datetime.now(),
-                    bitrate=1200,
-                    numeric=False
-                )
-                messages.append(message)
-                self.messages.append(message)
-                self.message_count += 1
-
+        flush()
         return messages
-
-    def get_recent_messages(self, max_age_seconds: int = 300) -> List[Dict[str, Any]]:
-        """Get messages from the last N seconds"""
-        now = datetime.now()
-        recent = []
-
-        for msg in self.messages:
-            age = (now - msg.timestamp).total_seconds()
-            if age < max_age_seconds:
-                recent.append(asdict(msg))
-
-        return recent
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get decoder statistics"""
-        return {
-            'total_messages': self.message_count,
-            'messages_stored': len(self.messages),
-            'addresses_seen': len(set(msg.address for msg in self.messages))
-        }

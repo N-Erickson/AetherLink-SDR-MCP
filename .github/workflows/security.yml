@@ -56,34 +56,36 @@ jobs:
         fi
 
     - name: Create issue on failure
-      if: failure() && github.event_name == 'schedule'
+      if: steps.audit.outcome == 'failure' && github.event_name == 'schedule'
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VULN_COUNT: ${{ steps.audit.outputs.vuln_count }}
       run: |
-        VULN_COUNT="${{ steps.audit.outputs.vuln_count }}"
-        BODY=$(cat <<'EOF'
-        ## Dependency Security Alert
-
-        The weekly security scan found **$VULN_COUNT** vulnerable dependencies.
-
-        ```
-        $(cat audit-results.txt)
-        ```
-
-        ### Next steps
-        1. Review the vulnerabilities above
-        2. Update affected packages in `pyproject.toml`
-        3. Run `pip-audit` locally to verify fixes
-
-        _This issue was created automatically by the security scan workflow._
-        EOF
-        )
+        {
+          echo "## Dependency Security Alert"
+          echo
+          echo "The weekly security scan found **${VULN_COUNT}** vulnerable dependencies."
+          echo
+          echo '```'
+          cat audit-results.txt
+          echo '```'
+          echo
+          echo "### Next steps"
+          echo "1. Review the vulnerabilities above"
+          echo "2. Update affected packages in \`pyproject.toml\`"
+          echo "3. Run \`pip-audit\` locally to verify fixes"
+          echo
+          echo "_This issue was created automatically by the security scan workflow._"
+        } > issue-body.md
 
         # Only create if no open security issue exists
-        EXISTING=$(gh issue list --label "security" --state open --json number --jq length)
+        EXISTING=$(gh issue list --label "security" --state open --json number --jq length 2>/dev/null || echo 0)
         if [ "$EXISTING" = "0" ]; then
           gh issue create \
-            --title "Security: $VULN_COUNT vulnerable dependencies found" \
-            --body "$BODY" \
-            --label "security"
+            --title "Security: ${VULN_COUNT} vulnerable dependencies found" \
+            --body-file issue-body.md \
+            --label "security" \
+          || gh issue create \
+            --title "Security: ${VULN_COUNT} vulnerable dependencies found" \
+            --body-file issue-body.md
         fi

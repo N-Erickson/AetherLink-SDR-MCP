@@ -89,7 +89,9 @@ class MeteorLRPTDecoder:
         output_dir: str,
         duration: int,
         gain: float = 40.0,
-        bias_tee: bool = False
+        bias_tee: bool = False,
+        satdump_path: str = "satdump",
+        device_index: int = 0,
     ) -> List[str]:
         """Build SatDump command for live LRPT reception
 
@@ -100,6 +102,8 @@ class MeteorLRPTDecoder:
             duration: Recording duration in seconds
             gain: RTL-SDR gain in dB
             bias_tee: Enable bias tee for LNA power
+            satdump_path: Resolved path to the satdump executable
+            device_index: RTL-SDR device index to use
 
         Returns:
             Command as list of strings
@@ -107,7 +111,7 @@ class MeteorLRPTDecoder:
         pipeline = self.get_satdump_pipeline(satellite)
 
         cmd = [
-            "satdump",
+            satdump_path,
             "live",
             pipeline,
             output_dir,
@@ -118,6 +122,8 @@ class MeteorLRPTDecoder:
             "--timeout", str(duration),
         ]
 
+        if device_index:
+            cmd.extend(["--source_id", str(device_index)])
         if bias_tee:
             cmd.append("--bias")
 

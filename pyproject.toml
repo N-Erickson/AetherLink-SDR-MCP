@@ -19,6 +19,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -32,11 +33,16 @@ dependencies = [
     "mcp>=1.23.0",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
-    "pyrtlsdr>=0.3.0",
+    # pyrtlsdr 0.4+ binds rtlsdr_set_dithering at import, which the stock Osmocom
+    # librtlsdr (e.g. Homebrew 2.0.2) does not export, so RTL-SDR support would fail
+    # to load on those systems. Stay on 0.3.x and shim its pkg_resources import.
+    "pyrtlsdr>=0.3.0,<0.4",
+    "sgp4>=2.22",
 ]
 
 [project.optional-dependencies]
-hackrf = ["pyhackrf>=0.2.0"]
+# HackRF support needs the system libhackrf library (brew install hackrf /
+# apt install libhackrf0), not a Python package.
 decoders = [
     "pyModeS>=2.19",
     "pyais>=2.5.0",
@@ -47,7 +53,7 @@ analysis = [
     "scikit-rf>=0.29.0",
 ]
 all = [
-    "aetherlink[hackrf,decoders,analysis]",
+    "aetherlink[decoders,analysis]",
 ]
 dev = [
     "aetherlink[all]",
