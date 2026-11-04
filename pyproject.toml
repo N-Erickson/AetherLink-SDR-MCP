@@ -39,26 +39,13 @@ dependencies = [
     # librtlsdr (e.g. Homebrew 2.0.2) does not export, so RTL-SDR support would fail
     # to load on those systems. Stay on 0.3.x and shim its pkg_resources import.
     "pyrtlsdr>=0.3.0,<0.4",
-    "sgp4>=2.22",
+    "sgp4>=2.22",        # satellite pass prediction
+    "pyModeS>=2.19",     # ADS-B decoding
+    "pyais>=2.5.0",      # AIS decoding
 ]
 
 [project.optional-dependencies]
-# HackRF support needs the system libhackrf library (brew install hackrf /
-# apt install libhackrf0), not a Python package.
-decoders = [
-    "pyModeS>=2.19",
-    "pyais>=2.5.0",
-    "construct>=2.10",
-]
-analysis = [
-    "matplotlib>=3.6.0",
-    "scikit-rf>=0.29.0",
-]
-all = [
-    "aetherlink[decoders,analysis]",
-]
 dev = [
-    "aetherlink[all]",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",

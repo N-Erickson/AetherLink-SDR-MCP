@@ -21,10 +21,11 @@ function Prompt-YesNo {
 # ─── Check prerequisites ─────────────────────────────────────────────────────
 
 function Check-Git {
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Write-Fail "Git not found. Download from https://git-scm.com/download/win"
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        Write-Ok "Git found"
+    } else {
+        Write-Warn "Git not found (only needed for installing from source)"
     }
-    Write-Ok "Git found"
 }
 
 function Check-Python {
@@ -149,32 +150,37 @@ function Install-SystemDeps {
 
 # ─── Install AetherLink ──────────────────────────────────────────────────────
 
+function Resolve-Aetherlink {
+    # The installed console script, wherever the chosen installer put it
+    $candidates = @()
+    $found = Get-Command aetherlink -ErrorAction SilentlyContinue
+    if ($found) { $candidates += $found.Source }
+    $candidates += "$env:USERPROFILE\.local\bin\aetherlink.exe"
+    $candidates += "$env:LOCALAPPDATA\uv\tools\aetherlink\Scripts\aetherlink.exe"
+    $candidates += "$env:USERPROFILE\.local\pipx\venvs\aetherlink\Scripts\aetherlink.exe"
+    $candidates += "$env:USERPROFILE\.aetherlink\Scripts\aetherlink.exe"
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
 function Install-AetherLink {
     Write-Info "Installing AetherLink..."
 
-    $script:AetherlinkCmd = ""
+    $script:AetherlinkCmd = $null
+    $script:AetherlinkArgs = @()
 
-    # Check for uv
     if (Get-Command uv -ErrorAction SilentlyContinue) {
-        & uv tool install aetherlink 2>&1 | Select-Object -Last 3
-        $script:AetherlinkCmd = "uvx aetherlink"
+        & uv tool install --force aetherlink 2>&1 | Select-Object -Last 3
         Write-Ok "AetherLink installed via uv"
     }
-    # Check for pipx
     elseif (Get-Command pipx -ErrorAction SilentlyContinue) {
-        try {
-            & pipx install aetherlink 2>&1 | Select-Object -Last 3
-        } catch {
-            & pipx upgrade aetherlink 2>&1 | Select-Object -Last 3
-        }
-        $aetherlinkPath = (Get-Command aetherlink -ErrorAction SilentlyContinue).Source
-        $script:AetherlinkCmd = if ($aetherlinkPath) { $aetherlinkPath } else { "pipx run aetherlink" }
+        & pipx install --force aetherlink 2>&1 | Select-Object -Last 3
         Write-Ok "AetherLink installed via pipx"
     }
-    # Fallback: create venv
     else {
         $venvDir = "$env:USERPROFILE\.aetherlink"
-
         if (Test-Path "$venvDir\Scripts\python.exe") {
             Write-Info "Upgrading existing install at $venvDir..."
             & "$venvDir\Scripts\pip" install --upgrade aetherlink -q 2>&1 | Select-Object -Last 3
@@ -184,31 +190,25 @@ function Install-AetherLink {
             & "$venvDir\Scripts\pip" install --upgrade pip -q 2>&1 | Select-Object -Last 1
             & "$venvDir\Scripts\pip" install aetherlink -q 2>&1 | Select-Object -Last 3
         }
-        $script:AetherlinkCmd = "$venvDir\Scripts\aetherlink.exe"
         Write-Ok "AetherLink installed in $venvDir"
+    }
+
+    $exe = Resolve-Aetherlink
+    if ($exe) {
+        $script:AetherlinkCmd = $exe
+    } elseif (Get-Command uvx -ErrorAction SilentlyContinue) {
+        $script:AetherlinkCmd = (Get-Command uvx).Source
+        $script:AetherlinkArgs = @("aetherlink")
+    } else {
+        Write-Fail "AetherLink was installed but its executable could not be found. Open a new terminal and run: aetherlink --setup"
     }
 
     # Verify
     try {
-        $ver = & $script:AetherlinkCmd --version 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok $ver
-        } else {
-            throw "non-zero exit"
-        }
+        $ver = & $script:AetherlinkCmd @($script:AetherlinkArgs + "--version") 2>&1
+        if ($LASTEXITCODE -eq 0) { Write-Ok "$ver" } else { throw "non-zero exit" }
     } catch {
-        # Fallback verify via Python import
-        $testPython = "$env:USERPROFILE\.aetherlink\Scripts\python.exe"
-        if (Test-Path $testPython) {
-            try {
-                $ver = & $testPython -c "from sdr_mcp import __version__; print(f'aetherlink {__version__}')" 2>&1
-                Write-Ok $ver
-            } catch {
-                Write-Warn "Package installed but verification failed -- try running 'aetherlink --version' manually"
-            }
-        } else {
-            Write-Warn "Package installed but verification failed"
-        }
+        Write-Warn "Package installed but 'aetherlink --version' failed: $_"
     }
 }
 
@@ -221,21 +221,17 @@ function Setup-ClaudeDesktop {
     $configDir = "$env:APPDATA\Claude"
     $configFile = "$configDir\claude_desktop_config.json"
 
-    # Try --setup first
+    # Try the built-in --setup first (it pins the config to this very install)
     try {
-        & $script:AetherlinkCmd --setup 2>&1
+        & $script:AetherlinkCmd @($script:AetherlinkArgs + "--setup") 2>&1
         if ($LASTEXITCODE -eq 0) { return }
     } catch { }
 
     # Manual fallback
-    $cmdJson = $script:AetherlinkCmd.Replace("\", "\\")
-
-    # Load or create config
     $config = @{ mcpServers = @{} }
     if (Test-Path $configFile) {
         try {
             $existing = Get-Content $configFile -Raw | ConvertFrom-Json
-            # Preserve existing config
             $config = @{}
             $existing.PSObject.Properties | ForEach-Object { $config[$_.Name] = $_.Value }
             if (-not $config.ContainsKey("mcpServers")) {
@@ -247,7 +243,6 @@ function Setup-ClaudeDesktop {
         }
     }
 
-    # Check existing
     $mcpServers = $config["mcpServers"]
     if ($mcpServers -is [PSCustomObject]) {
         $hash = @{}
@@ -271,10 +266,9 @@ function Setup-ClaudeDesktop {
 
     $mcpServers["aetherlink"] = @{
         command = $script:AetherlinkCmd
-        args = @()
+        args = @($script:AetherlinkArgs)
     }
 
-    # Write config
     New-Item -ItemType Directory -Force -Path $configDir | Out-Null
     $config | ConvertTo-Json -Depth 10 | Out-File -Encoding utf8 $configFile
     Write-Ok "Added AetherLink to $configFile"

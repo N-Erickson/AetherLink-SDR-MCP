@@ -25,6 +25,12 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Lint install.sh
+      run: |
+        bash -n install.sh
+        sudo apt-get install -y -qq shellcheck >/dev/null 2>&1 || true
+        if command -v shellcheck >/dev/null; then shellcheck -S warning install.sh; fi
+
     - name: Run install script (non-interactive)
       env:
         NONINTERACTIVE: "1"
@@ -85,6 +91,14 @@ jobs:
     - uses: actions/setup-python@v7
       with:
         python-version: "3.12"
+
+    - name: Parse install.ps1
+      run: |
+        $tokens = $null; $errors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+        if ($errors) { $errors | ForEach-Object { Write-Error "$($_.Message) (line $($_.Extent.StartLineNumber))" }; exit 1 }
+        Write-Host "install.ps1 parses OK"
+      shell: pwsh
 
     - name: Test install from source
       run: |

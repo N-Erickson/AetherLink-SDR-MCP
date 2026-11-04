@@ -1272,10 +1272,7 @@ class SDRMCPServer:
                 if self._task_running("adsb"):
                     return _text("ADS-B tracking already active")
                 if not ADSB_AVAILABLE:
-                    raise SDRError(
-                        "pyModeS is not installed. Install with: pip install pyModeS "
-                        "(or pip install 'aetherlink[decoders]')"
-                    )
+                    raise SDRError("pyModeS is not installed. Install with: pip install pyModeS")
                 self._require_device_free()
 
                 gain_arg = arguments.get("gain")
@@ -1668,10 +1665,7 @@ class SDRMCPServer:
                 if self._task_running("ais"):
                     return _text("AIS tracking already active")
                 if not AIS_AVAILABLE:
-                    raise SDRError(
-                        "pyais is not installed. Install with: pip install pyais "
-                        "(or pip install 'aetherlink[decoders]')"
-                    )
+                    raise SDRError("pyais is not installed. Install with: pip install pyais")
                 engine = str(arguments.get("engine", "auto") or "auto").lower()
                 if engine not in ("auto", "native", "external"):
                     raise SDRError("engine must be auto, native or external")
@@ -3024,14 +3018,19 @@ def setup_claude_desktop():
 
     config_file = os.path.join(config_dir, "claude_desktop_config.json")
 
-    # Prefer the entry point of the install that is running this command, so Claude
-    # Desktop uses the same version. Fall back to uvx, then to python -m.
-    aetherlink_path = shutil.which("aetherlink")
+    # Point Claude Desktop at the very install that is running this command, so it
+    # always launches the same code. The entry point next to this interpreter is
+    # stable for pip/pipx/uv-tool installs; when running under `uvx` the interpreter
+    # lives in uv's cache, which can be evicted, so use uvx itself in that case.
+    exe_dir = os.path.dirname(sys.executable)
+    sibling = os.path.join(exe_dir, "aetherlink.exe" if system == "Windows" else "aetherlink")
+    normalized = sys.executable.replace("\\", "/")
+    in_uv_cache = any(marker in normalized for marker in ("/.cache/uv/", "/uv/archive-", "/uv/cache/"))
     uvx_path = shutil.which("uvx")
-    if aetherlink_path:
-        server_entry = {"command": aetherlink_path, "args": []}
-    elif uvx_path:
+    if in_uv_cache and uvx_path:
         server_entry = {"command": uvx_path, "args": ["aetherlink"]}
+    elif os.path.isfile(sibling):
+        server_entry = {"command": sibling, "args": []}
     else:
         server_entry = {"command": sys.executable, "args": ["-m", "sdr_mcp"]}
 
