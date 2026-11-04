@@ -60,10 +60,40 @@ jobs:
         # Update __init__.py
         sed -i "s/^__version__ = \".*\"/__version__ = \"${NEW}\"/" sdr_mcp/__init__.py
 
+    - name: Build release notes from CHANGELOG.md
+      run: |
+        VERSION="${{ steps.bump.outputs.version }}"
+        PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+        python3 - "$VERSION" "$PREV_TAG" <<'PY'
+        import datetime, re, subprocess, sys
+        version, prev_tag = sys.argv[1], sys.argv[2]
+        text = open("CHANGELOG.md", encoding="utf-8").read()
+        # Body of the Unreleased section (up to the next "## " heading)
+        match = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+        body = (match.group(1) if match else "").strip()
+        if not body:
+            # Fall back to commit subjects since the previous tag
+            rng = f"{prev_tag}..HEAD" if prev_tag else "HEAD"
+            log = subprocess.run(["git", "log", "--format=- %s", rng], capture_output=True, text=True).stdout
+            body = "\n".join(l for l in log.splitlines() if l.strip() and not l.startswith("- release:")) or "- Maintenance release"
+        notes = f"## AetherLink {version}\n\n{body}\n"
+        if prev_tag:
+            notes += f"\n**Full changelog:** https://github.com/${{ github.repository }}/compare/{prev_tag}...v{version}\n"
+        open("release-notes.md", "w", encoding="utf-8").write(notes)
+        # Move the Unreleased entries under a dated version heading, keep an empty Unreleased
+        today = datetime.date.today().isoformat()
+        if match:
+            text = text[:match.start()] + f"## [Unreleased]\n\n## [{version}] - {today}\n\n{body}\n\n" + text[match.end():]
+        else:
+            text = text.rstrip() + f"\n\n## [{version}] - {today}\n\n{body}\n"
+        open("CHANGELOG.md", "w", encoding="utf-8").write(text)
+        PY
+        echo "--- release notes ---"; cat release-notes.md
+
     - name: Commit and tag
       run: |
         VERSION="${{ steps.bump.outputs.version }}"
-        git add pyproject.toml sdr_mcp/__init__.py
+        git add pyproject.toml sdr_mcp/__init__.py CHANGELOG.md
         git commit -m "release: v${VERSION}"
         git tag "v${VERSION}"
         git push origin main --tags
@@ -75,7 +105,7 @@ jobs:
         VERSION="${{ steps.bump.outputs.version }}"
         gh release create "v${VERSION}" \
           --title "v${VERSION}" \
-          --generate-notes
+          --notes-file release-notes.md
 
     - name: Publish to PyPI
       env:
