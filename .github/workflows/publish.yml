@@ -1,10 +1,18 @@
 name: Publish to PyPI
 
-# Triggered when a version tag is pushed (e.g. v0.2.0)
+# Triggered when a version tag is pushed (e.g. v0.2.0), or dispatched for a tag.
+# The Release workflow dispatches this explicitly: tags it pushes with the
+# repository token do not fire push-triggered workflows.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to publish (e.g. v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.tag || github.ref }}
     - uses: actions/setup-python@v7
       with:
         python-version: "3.12"
@@ -34,6 +44,8 @@ jobs:
       id-token: write  # Required for trusted publishing
     steps:
     - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.tag || github.ref }}
 
     - uses: actions/setup-python@v7
       with:
@@ -43,8 +55,11 @@ jobs:
       run: pip install build
 
     - name: Verify version matches tag
+      env:
+        TAG_INPUT: ${{ inputs.tag }}
       run: |
-        TAG="${GITHUB_REF#refs/tags/v}"
+        TAG="${TAG_INPUT:-${GITHUB_REF#refs/tags/}}"
+        TAG="${TAG#v}"
         PKG_VER=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
         INIT_VER=$(python -c "exec(open('sdr_mcp/__init__.py').read()); print(__version__)")
         echo "Tag: $TAG | pyproject.toml: $PKG_VER | __init__.py: $INIT_VER"

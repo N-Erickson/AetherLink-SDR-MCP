@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  actions: write   # to dispatch the Publish workflow
 
 jobs:
   release:
@@ -75,3 +76,12 @@ jobs:
         gh release create "v${VERSION}" \
           --title "v${VERSION}" \
           --generate-notes
+
+    - name: Publish to PyPI
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # A tag pushed with GITHUB_TOKEN does not trigger push workflows, so start Publish directly
+        VERSION="${{ steps.bump.outputs.version }}"
+        gh workflow run publish.yml --ref main -f "tag=v${VERSION}"
+        echo "Dispatched Publish for v${VERSION}"
