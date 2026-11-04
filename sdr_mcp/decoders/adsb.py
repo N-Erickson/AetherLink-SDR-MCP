@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from . import cpr
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -91,28 +93,32 @@ class ADSBDecoder:
         self.receiver_lon = float(longitude)
 
     def _update_position(self, aircraft: Aircraft, msg_hex: str, tc: int):
-        """Decode an airborne or surface position from CPR-encoded frames."""
-        if pms is None:
-            return
+        """Decode an airborne or surface position from CPR-encoded frames.
+
+        Uses the in-repo CPR implementation so it behaves the same with pyModeS 2 and 3.
+        """
         try:
-            oe = pms.adsb.oe_flag(msg_hex)
-        except Exception:
+            cpr_format, cpr_lat, cpr_lon = cpr.cpr_fields(msg_hex)
+        except (ValueError, IndexError):
             return
         now = time.time()
         frames = self._cpr.setdefault(aircraft.icao, {})
-        frames["odd" if oe else "even"] = (msg_hex, now)
+        frames["odd" if cpr_format else "even"] = (cpr_lat, cpr_lon, now)
 
         position = None
         airborne = 9 <= tc <= 18 or 20 <= tc <= 22
         try:
             if airborne:
                 even, odd = frames.get("even"), frames.get("odd")
-                if even and odd and abs(even[1] - odd[1]) <= CPR_PAIR_MAX_AGE_S:
-                    position = pms.adsb.position(even[0], odd[0], even[1], odd[1])
+                if even and odd and abs(even[2] - odd[2]) <= CPR_PAIR_MAX_AGE_S:
+                    position = cpr.airborne_global(even[0], even[1], odd[0], odd[1],
+                                                   even_is_newer=even[2] >= odd[2])
                 if position is None and self.receiver_lat is not None:
-                    position = pms.adsb.position_with_ref(msg_hex, self.receiver_lat, self.receiver_lon)
+                    position = cpr.airborne_local(cpr_lat, cpr_lon, cpr_format,
+                                                  self.receiver_lat, self.receiver_lon)
             elif 5 <= tc <= 8 and self.receiver_lat is not None:
-                position = pms.adsb.surface_position_with_ref(msg_hex, self.receiver_lat, self.receiver_lon)
+                position = cpr.surface_local(cpr_lat, cpr_lon, cpr_format,
+                                             self.receiver_lat, self.receiver_lon)
         except Exception as e:
             logger.debug(f"CPR decode failed for {aircraft.icao}: {e}")
             position = None
@@ -120,10 +126,8 @@ class ADSBDecoder:
         if not position:
             return
         lat, lon = position
-        if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            return
-        aircraft.latitude = round(float(lat), 5)
-        aircraft.longitude = round(float(lon), 5)
+        aircraft.latitude = lat
+        aircraft.longitude = lon
         aircraft.position_time = datetime.now()
         aircraft.on_ground = not airborne
         self.position_count += 1
@@ -176,7 +180,7 @@ class ADSBDecoder:
                 # Surface position (needs the receiver location as CPR reference)
                 self._update_position(aircraft, msg_hex, tc)
 
-            elif isinstance(tc, int) and 9 <= tc <= 18:
+            elif isinstance(tc, int) and (9 <= tc <= 18 or 20 <= tc <= 22):
                 alt = decoded.get("altitude")
                 if alt is not None:
                     aircraft.altitude = alt
