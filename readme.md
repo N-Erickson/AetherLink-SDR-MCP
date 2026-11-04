@@ -82,36 +82,48 @@ pip install -e ".[dev]"
 
 ## Quick Start
 
-### 1. Configure Claude Desktop
+### 1. Point Claude Desktop at AetherLink
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or equivalent:
+```bash
+aetherlink --setup
+```
+
+This writes the `aetherlink` entry into your Claude Desktop config (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`, Windows: `%APPDATA%\Claude\claude_desktop_config.json`, Linux: `~/.config/Claude/claude_desktop_config.json`) without touching your other MCP servers, and points it at the exact install you just made. The installers run this step for you.
+
+<details>
+<summary>Manual configuration</summary>
+
+If you prefer to edit the config yourself, use the interpreter that has AetherLink installed:
 
 ```json
 {
   "mcpServers": {
     "aetherlink": {
-      "command": "/path/to/AetherLink-SDR-MCP/venv/bin/python",
-      "args": ["-m", "sdr_mcp.server"],
-      "cwd": "/path/to/AetherLink-SDR-MCP"
+      "command": "/path/to/python",
+      "args": ["-m", "sdr_mcp"]
     }
   }
 }
 ```
 
-**Important:** Replace `/path/to/` with your actual path. Run `which python` with your venv activated to find the correct Python path.
+</details>
 
 ### 2. Restart Claude Desktop
 
-Quit completely (Cmd+Q) and restart Claude Desktop to load the MCP server.
+Quit completely (Cmd+Q on macOS) and start it again so the server is loaded.
 
-### 3. Test the Connection
+### 3. Try it
 
-In Claude Desktop:
+Plug in the RTL-SDR and ask, in Claude Desktop:
 ```
-Connect to my RTL-SDR
+What aircraft are overhead right now?
+```
+or
+```
+Analyze the spectrum at 100 MHz
 ```
 
-You should see: "Successfully connected to RTL-SDR"
+There is no connect step: the first attached RTL-SDR is opened automatically, and the receiver location is detected automatically. `Connect to my HackRF` is only needed for HackRF hardware or to pick a specific dongle.
 
 ### Troubleshooting
 
@@ -119,6 +131,8 @@ You should see: "Successfully connected to RTL-SDR"
 - **"Device busy" errors:** Only one program can use the SDR at a time. Close GQRX, SDR#, or other SDR software.
 - **Linux device permissions:** Add udev rules for RTL-SDR (`/etc/udev/rules.d/20-rtlsdr.rules`) and blacklist the `dvb_usb_rtl28xxu` kernel module.
 - **E4000 tuner gap:** Frequencies 1084-1239 MHz may not work on E4000-based dongles. This is normal hardware behavior.
+- **"No RTL-SDR was detected":** check `sdr_list_devices`; on Linux make sure the DVB kernel module is blacklisted (the installer does this); on Windows the WinUSB driver must be installed with Zadig.
+- **Weak ADS-B reception:** 1090 MHz signals are weak. A short indoor antenna only hears aircraft nearly overhead; a 1090 MHz antenna near a window or outdoors makes the biggest difference. `aviation_get_aircraft` tells you which receiver program is running and whether it switched to `rtl_adsb`.
 - **"RTL-SDR library not available ... rtlsdr_set_dithering":** pyrtlsdr 0.4 and newer bind a function that only the rtl-sdr-blog driver provides. AetherLink pins `pyrtlsdr<0.4` for this reason; if you installed pyrtlsdr yourself, downgrade it or install the rtl-sdr-blog driver.
 - **Recordings location:** files go to `~/AetherLink/recordings` by default; set `AETHERLINK_RECORDINGS_DIR` to change it.
 - **Testing without hardware:** set `AETHERLINK_MOCK_SDR=1` to use a mock RTL-SDR; `AETHERLINK_MOCK_IQ_FILE` can point at a `.npy` file of complex samples that the mock plays back in a loop (useful for exercising the built-in decoders).
@@ -138,9 +152,9 @@ You should see: "Successfully connected to RTL-SDR"
 | Protocol    | Description          | Status      |
 |-------------|---------------------|-------------|
 | **ADS-B**   | Aircraft tracking   | ✅ Ready    |
-| **POCSAG**  | Pager decoding      | ✅ Ready    |
-| **AIS**     | Ship tracking       | ✅ Ready    |
-| **Meteor-M LRPT**| Weather satellites (M2-3, M2-4) | ✅ Ready |
+| **POCSAG**  | Pager decoding      | ✅ Built-in decoder, no extra software |
+| **AIS**     | Ship tracking       | ✅ Built-in receiver, no extra software |
+| **Meteor-M LRPT**| Weather satellites (M2-3, M2-4) | ✅ Ready (SatDump, runs in the background with pass prediction) |
 | **ISM Band**| 433MHz/315MHz devices | ✅ Ready  |
 
 ### Protocol Details
@@ -154,7 +168,7 @@ You should see: "Successfully connected to RTL-SDR"
 - Decodes positions from even/odd CPR frame pairs; with a receiver location it also decodes from single frames, shows distance and bearing, and lists nearest aircraft first
 - Optional aircraft registration/type/operator lookup via hexdb.io
 - Emits live tracking links for observed ICAO addresses
-- **FULLY TESTED AND WORKING**
+- Verified live: aircraft decoded with positions matching a public ADS-B feed
 
 **POCSAG (152/454/929 MHz):**
 - Built-in decoder: channel filter, FM discriminator, automatic frequency control (absorbs dongle ppm error), bit timing recovery, BCH(31,21) error correction
@@ -373,7 +387,7 @@ Show me the ISM devices
 ```
 AetherLink-SDR-MCP/
 ├── sdr_mcp/
-│   ├── server.py              # Main MCP server (28 tools)
+│   ├── server.py              # Main MCP server (34 tools)
 │   ├── cli.py                 # aetherlink console entry point (--setup, --version)
 │   ├── __main__.py            # python -m sdr_mcp entry point
 │   ├── hardware/
