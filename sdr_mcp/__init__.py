@@ -2,7 +2,7 @@
 AetherLink - Software Defined Radio Model Context Protocol Server
 """
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 __author__ = "N-Erickson"
 
 # Lazy imports to avoid circular dependencies when running as module
