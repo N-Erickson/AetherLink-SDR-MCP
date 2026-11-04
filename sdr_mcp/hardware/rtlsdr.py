@@ -4,6 +4,7 @@ RTL-SDR hardware support for SDR-MCP
 
 import asyncio
 import logging
+import os
 from typing import Any, AsyncIterator, Optional
 
 import numpy as np
@@ -40,6 +41,9 @@ except (ImportError, AttributeError, OSError) as e:
     RTLSDR_AVAILABLE = False
     RTLSDR_IMPORT_ERROR = str(e)
     logger.warning(f"RTL-SDR library not available: {e}. Install librtlsdr and pyrtlsdr.")
+
+# librtlsdr rtlsdr_tuner enum
+TUNER_NAMES = {0: "Unknown", 1: "E4000", 2: "FC0012", 3: "FC0013", 4: "FC2580", 5: "R820T", 6: "R828D"}
 
 RTLSDR_INSTALL_HINT = (
     "Install the RTL-SDR drivers ('brew install librtlsdr' on macOS, "
@@ -118,7 +122,8 @@ class RTLSDRDevice(SDRDevice):
                 await self.set_bias_tee(True)
 
             try:
-                self.tuner_type = str(self.device.get_tuner_type())
+                code = self.device.get_tuner_type()
+                self.tuner_type = TUNER_NAMES.get(int(code), str(code))
             except Exception:
                 self.tuner_type = None
             logger.info(f"Connected to RTL-SDR #{self.device_index} (tuner: {self.tuner_type})")
@@ -276,6 +281,7 @@ class RTLSDRDevice(SDRDevice):
         reader = asyncio.ensure_future(
             asyncio.to_thread(self.device.read_samples_async, _callback, int(chunk_size))
         )
+        getter: Optional[asyncio.Future] = None
         try:
             while True:
                 getter = asyncio.ensure_future(queue.get())
@@ -283,11 +289,12 @@ class RTLSDRDevice(SDRDevice):
                 if getter in done:
                     yield getter.result()
                     continue
-                getter.cancel()
                 # Reader finished on its own: surface its error, or stop cleanly.
                 reader.result()
                 break
         finally:
+            if getter is not None and not getter.done():
+                getter.cancel()
             try:
                 self.device.cancel_read_async()
             except Exception:
@@ -328,16 +335,41 @@ class RTLSDRDevice(SDRDevice):
 
 
 class MockRTLSDRDevice(SDRDevice):
-    """Mock RTL-SDR for offline testing. Never substituted for real hardware automatically."""
+    """Mock RTL-SDR for offline testing. Never substituted for real hardware automatically.
 
-    def __init__(self, device_index: int = 0):
+    Enabled for the server with AETHERLINK_MOCK_SDR=1. If AETHERLINK_MOCK_IQ_FILE
+    points at a .npy file of complex samples, reads play it back in a loop (at the
+    device sample rate) so decoders can be exercised end to end without hardware.
+    """
+
+    def __init__(self, device_index: int = 0, iq_file: Optional[str] = None):
         super().__init__(device_index)
         self.device_name = "RTL-SDR (Mock)"
         self.frequency = 100e6
+        self.min_frequency = 24e6
+        self.max_frequency = 1.766e9
+        self.min_sample_rate = 225e3
+        self.max_sample_rate = 3.2e6
+        self.ppm = 0
+        self.bias_tee = False
+        self._iq: Optional[np.ndarray] = None
+        self._pos = 0
+        path = iq_file or os.environ.get("AETHERLINK_MOCK_IQ_FILE")
+        if path and os.path.exists(path):
+            try:
+                self._iq = np.load(path).astype(np.complex64)
+                logger.info(f"Mock RTL-SDR playing back {len(self._iq)} samples from {path}")
+            except Exception as e:
+                logger.warning(f"Could not load mock IQ file {path}: {e}")
         logger.info("Using mock RTL-SDR implementation")
+
+    @staticmethod
+    def list_devices() -> list:
+        return [{"type": "rtlsdr", "index": 0, "name": "RTL-SDR (Mock)", "serial": "MOCK"}]
 
     async def connect(self) -> bool:
         self.device = True  # Fake connection
+        self.tuner_type = "Mock"
         logger.info("Mock RTL-SDR connected")
         return True
 
@@ -346,10 +378,14 @@ class MockRTLSDRDevice(SDRDevice):
         logger.info("Mock RTL-SDR disconnected")
 
     async def set_frequency(self, freq: float):
+        if not (self.min_frequency <= freq <= self.max_frequency):
+            raise ValueError(f"Frequency {freq/1e6:.3f} MHz out of RTL-SDR range")
         self.frequency = freq
         logger.debug(f"Mock RTL-SDR set frequency to {freq/1e6:.3f} MHz")
 
     async def set_sample_rate(self, rate: float):
+        if not (self.min_sample_rate <= rate <= self.max_sample_rate):
+            raise ValueError(f"Sample rate {rate/1e6:.3f} Msps out of RTL-SDR range")
         self.sample_rate = rate
         logger.debug(f"Mock RTL-SDR set sample rate to {rate/1e6:.3f} Msps")
 
@@ -357,13 +393,28 @@ class MockRTLSDRDevice(SDRDevice):
         self.gain = gain
         logger.debug(f"Mock RTL-SDR set gain to {gain}")
 
+    async def set_freq_correction(self, ppm: int):
+        self.ppm = int(ppm)
+
+    async def set_bias_tee(self, enabled: bool):
+        self.bias_tee = bool(enabled)
+
     async def read_samples(self, num_samples: int) -> np.ndarray:
-        """Generate mock samples with some signals, paced like real hardware"""
+        """Play back the IQ file, or generate noise with a few tones, paced like real hardware"""
         await asyncio.sleep(num_samples / self.sample_rate)
+        if self._iq is not None and len(self._iq):
+            out = np.empty(num_samples, dtype=np.complex64)
+            filled = 0
+            while filled < num_samples:
+                take = min(num_samples - filled, len(self._iq) - self._pos)
+                out[filled:filled + take] = self._iq[self._pos:self._pos + take]
+                filled += take
+                self._pos = (self._pos + take) % len(self._iq)
+            return out
         noise = (np.random.randn(num_samples) + 1j * np.random.randn(num_samples)) * 0.1
         t = np.arange(num_samples) / self.sample_rate
         signal = noise
-        signal += 0.5 * np.exp(2j * np.pi * 1e3 * t)    # 1 kHz tone
-        signal += 0.3 * np.exp(2j * np.pi * 10e3 * t)   # 10 kHz tone
-        signal += 0.2 * np.exp(2j * np.pi * -5e3 * t)   # -5 kHz tone
+        signal += 0.5 * np.exp(2j * np.pi * 100e3 * t)   # +100 kHz tone
+        signal += 0.3 * np.exp(2j * np.pi * 250e3 * t)   # +250 kHz tone
+        signal += 0.2 * np.exp(2j * np.pi * -400e3 * t)  # -400 kHz tone
         return signal.astype(np.complex64)

@@ -23,7 +23,7 @@ import mcp.server.stdio
 
 from . import __version__
 from .hardware.base import SDRDevice
-from .hardware.rtlsdr import RTLSDRDevice, RTLSDR_AVAILABLE, RTLSDR_IMPORT_ERROR, RTLSDR_INSTALL_HINT
+from .hardware.rtlsdr import RTLSDRDevice, MockRTLSDRDevice, RTLSDR_AVAILABLE, RTLSDR_IMPORT_ERROR, RTLSDR_INSTALL_HINT
 from .hardware.hackrf import HackRFDevice, HACKRF_AVAILABLE, HACKRF_IMPORT_ERROR, HACKRF_INSTALL_HINT
 from .analysis.spectrum import SpectrumAnalyzer, SignalRecorder, FrequencyScanner, AudioRecorder
 from .utils.validators import sanitize_path_component, find_binary
@@ -34,6 +34,9 @@ from .decoders.ais import AISDecoder, AIS_AVAILABLE
 from .decoders.rtl433 import RTL433Decoder
 from .decoders.meteor_lrpt import MeteorLRPTDecoder, MeteorPass
 from .decoders.satellite_passes import PassPredictor, NORAD_IDS, SGP4_AVAILABLE
+from .decoders.pocsag_native import POCSAGDemodulator
+from .decoders.ais_native import AISReceiver, AIS_CENTER_HZ
+from .utils.location import LocationResolver, Location
 
 # Logging goes to stderr; stdout is the MCP transport and must stay clean.
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +58,9 @@ VALID_WINDOWS = {"hamming", "hann", "blackman", "blackman-harris", "flattop"}
 
 # Install hints for external tools
 DUMP1090_HINT = "brew install dump1090-fa (macOS) or sudo apt install dump1090-fa (Debian/Ubuntu)"
+RTL_ADSB_HINT = "rtl_adsb ships with the RTL-SDR drivers: brew install librtlsdr / sudo apt install rtl-sdr"
+ADSB_FALLBACK_AFTER_S = 45.0   # auto mode switches engine if dump1090 hears nothing for this long
+ADSB_DEFAULT_GAIN = 49.6       # RTL-SDR maximum; 1090 MHz signals are weak and dump1090 can adapt downwards
 RTL_FM_HINT = "brew install librtlsdr (macOS) or sudo apt install rtl-sdr (Debian/Ubuntu)"
 MULTIMON_HINT = (
     "sudo apt install multimon-ng (Debian/Ubuntu) or build from "
@@ -83,7 +89,13 @@ STOP_TOOLS = {
     "meteor": "satellite_stop_decoding",
 }
 CAPTURE_TASKS = {"recorder": "an IQ recording (recording_stop)",
-                 "audio_recorder": "an audio recording (audio_record_stop)"}
+                 "audio_recorder": "an audio recording (audio_record_stop)",
+                 "pocsag": "POCSAG pager decoding (pager_stop_decoding)",
+                 "ais": "AIS vessel tracking (marine_stop_tracking)"}
+# Built-in decoders tune the radio off-channel so the signal sits clear of the DC spike
+POCSAG_TUNE_OFFSET_HZ = 250e3
+AIS_TUNE_OFFSET_HZ = 100e3
+MOCK_ENV = "AETHERLINK_MOCK_SDR"
 
 # Paging allocations scanned by pager_find_frequencies (Hz)
 PAGER_BANDS = {
@@ -131,10 +143,11 @@ class SDRMCPServer:
                 "Spectrum, recording and audio tools need sdr_connect first. The decoder "
                 "tools (aviation_*, pager_*, marine_*, ism_*, satellite_*) run external "
                 "programs that take exclusive control of the radio; Python-side control is "
-                "paused while one runs and restored when it is stopped. A receiver location "
-                "(latitude/longitude arguments, or the AETHERLINK_LATITUDE and "
-                "AETHERLINK_LONGITUDE environment variables) enables aircraft distances and "
-                "satellite pass prediction."
+                "paused while one runs and restored when it is stopped. Pager (POCSAG) and "
+                "AIS decoding have built-in decoders that need no extra software. The first "
+                "attached RTL-SDR is opened automatically, and the receiver location is "
+                "auto-detected for aircraft distances and satellite pass prediction "
+                "(latitude/longitude arguments override it)."
             ),
         )
         self.sdr: Optional[SDRDevice] = None
@@ -148,6 +161,12 @@ class SDRMCPServer:
         self.meteor_decoder = MeteorLRPTDecoder()
         self.meteor_state: Dict[str, Any] = {"status": "idle"}
         self.pass_predictor = PassPredictor(cache_dir=recordings_dir())
+        self.locator = LocationResolver(cache_dir=recordings_dir())
+        self.adsb_decoder.on_receiver_estimate = self._on_receiver_estimate
+        self.pocsag_demod: Optional[POCSAGDemodulator] = None
+        self.ais_receiver: Optional[AISReceiver] = None
+        self.adsb_engine: Optional[str] = None
+        self.adsb_engine_note: Optional[str] = None
         self.active_decoders: Dict[str, asyncio.Task] = {}
 
         # Analysis modules
@@ -220,6 +239,61 @@ class SDRMCPServer:
             raise SDRError("No SDR connected. Use sdr_connect first.")
         return self.sdr
 
+    @staticmethod
+    def _mock_mode() -> bool:
+        return os.environ.get(MOCK_ENV, "").strip().lower() in ("1", "true", "yes")
+
+    def _new_rtlsdr(self, index: int) -> SDRDevice:
+        return MockRTLSDRDevice(index) if self._mock_mode() else RTLSDRDevice(index)
+
+    async def _ensure_sdr(self) -> SDRDevice:
+        """Python-side control of a radio, opening the first RTL-SDR automatically if none is open."""
+        if self.sdr_lease:
+            raise self._lease_error()
+        if self.sdr:
+            return self.sdr
+        attached = self._mock_mode() or (RTLSDR_AVAILABLE and bool(RTLSDRDevice.list_devices()))
+        if not attached:
+            if not RTLSDR_AVAILABLE:
+                raise SDRError(f"RTL-SDR support is unavailable: {RTLSDR_IMPORT_ERROR}. {RTLSDR_INSTALL_HINT}")
+            raise SDRError(
+                "No SDR is connected and no RTL-SDR was detected. Plug in an RTL-SDR, or use "
+                "sdr_connect for a HackRF."
+            )
+        device = self._new_rtlsdr(0)
+        if not await device.connect():
+            raise SDRError(
+                "An RTL-SDR is attached but could not be opened. Make sure no other program "
+                "(GQRX, SDR#, dump1090, rtl_433) is using it."
+            )
+        self.sdr = device
+        logger.info(f"Auto-connected {device.device_name} #0")
+        return device
+
+    async def _receiver_location(self, arguments: Optional[Dict[str, Any]] = None,
+                                 allow_network: bool = True) -> Optional[Location]:
+        """Receiver location: arguments, environment, cache, IP geolocation, or aircraft estimate."""
+        try:
+            return await asyncio.to_thread(self.locator.resolve, arguments or {}, allow_network)
+        except ValueError as e:
+            raise SDRError(str(e))
+
+    def _on_receiver_estimate(self, latitude: float, longitude: float):
+        accuracy = self.adsb_decoder.receiver_accuracy_km or 50.0
+        self.locator.remember_estimate(latitude, longitude, accuracy_km=accuracy)
+
+    def _on_pocsag_message(self, message):
+        self.pocsag_decoder.add_message(message)
+        logger.info(
+            f"POCSAG{message.bitrate} addr {message.address} fn {message.function} "
+            f"[{message.message_type}]: {message.message[:80]}"
+        )
+
+    def _on_ais_sentence(self, sentence: str):
+        result = self.ais_decoder.feed_line(sentence)
+        if result:
+            logger.info(f"AIS type {result['message_type']} from MMSI {result['mmsi']}")
+
     def _require_capture_idle(self):
         """Only one Python-side capture (sync read or stream) can run at a time."""
         for name, label in CAPTURE_TASKS.items():
@@ -269,7 +343,7 @@ class SDRMCPServer:
         logger.info("Reconnecting Python SDR control")
         device: SDRDevice = (
             HackRFDevice(snapshot["index"]) if snapshot["type"] == "hackrf"
-            else RTLSDRDevice(snapshot["index"])
+            else self._new_rtlsdr(snapshot["index"])
         )
         if snapshot.get("ppm") and hasattr(device, "ppm"):
             device.ppm = snapshot["ppm"]          # RTL-SDR re-applies this on connect
@@ -294,25 +368,6 @@ class SDRMCPServer:
             self.sdr = device
         except Exception as e:
             logger.error(f"Error reconnecting SDR: {e}")
-
-    @staticmethod
-    def _receiver_location(arguments: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-        """Receiver lat/lon from tool arguments, falling back to the environment."""
-        lat = arguments.get("receiver_latitude", arguments.get("latitude"))
-        lon = arguments.get("receiver_longitude", arguments.get("longitude"))
-        if lat is None or lon is None:
-            env_lat, env_lon = (os.environ.get(k) for k in LOCATION_ENV)
-            if env_lat and env_lon:
-                try:
-                    lat, lon = float(env_lat), float(env_lon)
-                except ValueError:
-                    raise SDRError(f"{LOCATION_ENV[0]} / {LOCATION_ENV[1]} must be decimal degrees")
-        if lat is None or lon is None:
-            return None, None
-        lat, lon = float(lat), float(lon)
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            raise SDRError("Latitude must be between -90 and 90 and longitude between -180 and 180")
-        return lat, lon
 
     def _status_dict(self) -> Dict[str, Any]:
         active = self._running_tasks()
@@ -515,16 +570,20 @@ class SDRMCPServer:
                 Tool(
                     name="aviation_track_aircraft",
                     description=(
-                        "Start tracking aircraft via ADS-B on 1090 MHz using dump1090. Takes exclusive "
-                        "control of the RTL-SDR until aviation_stop_tracking or the duration elapses."
+                        "Start tracking aircraft via ADS-B on 1090 MHz (dump1090, or rtl_adsb from the RTL-SDR "
+                        "drivers). Takes exclusive control of the RTL-SDR until aviation_stop_tracking or the "
+                        "duration elapses."
                     ),
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "gain": {
                                 "type": "number",
-                                "description": "RTL-SDR gain in dB for dump1090",
-                                "default": 40,
+                                "description": (
+                                    "RTL-SDR gain in dB (default 49.6, the maximum; dump1090-fa then adapts it "
+                                    "downwards automatically if the input is too loud)"
+                                ),
+                                "default": 49.6,
                             },
                             "duration": {
                                 "type": "integer",
@@ -545,14 +604,22 @@ class SDRMCPServer:
                             "receiver_latitude": {
                                 "type": "number",
                                 "description": (
-                                    "Receiver latitude in decimal degrees. With a location, positions decode from "
-                                    "single frames and the aircraft list shows distance. Falls back to "
-                                    "AETHERLINK_LATITUDE."
+                                    "Optional override of the receiver latitude (decimal degrees). Normally the "
+                                    "location is detected automatically."
                                 ),
                             },
                             "receiver_longitude": {
                                 "type": "number",
-                                "description": "Receiver longitude in decimal degrees. Falls back to AETHERLINK_LONGITUDE.",
+                                "description": "Optional override of the receiver longitude (decimal degrees).",
+                            },
+                            "engine": {
+                                "type": "string",
+                                "enum": ["auto", "dump1090", "rtl_adsb"],
+                                "description": (
+                                    "Receiver program. auto (default) uses dump1090 when installed and falls back "
+                                    "to rtl_adsb (part of the RTL-SDR drivers) if dump1090 is missing or hears nothing."
+                                ),
+                                "default": "auto",
                             },
                         },
                     }
@@ -590,10 +657,10 @@ class SDRMCPServer:
                 Tool(
                     name="pager_start_decoding",
                     description=(
-                        "Start decoding POCSAG pager messages using rtl_fm piped into multimon-ng. "
-                        "Takes exclusive control of the RTL-SDR until pager_stop_decoding. Common "
-                        "paging frequencies: 152-153 MHz, 454 MHz, 929-931 MHz (check RadioReference "
-                        "for your area)."
+                        "Start decoding POCSAG pager messages with the built-in decoder (no extra software; "
+                        "512/1200/2400 baud at once). Runs until pager_stop_decoding or the duration ends. "
+                        "Common paging frequencies: 152-153 MHz, 454 MHz, 929-931 MHz; pager_find_frequencies "
+                        "can locate active channels."
                     ),
                     inputSchema={
                         "type": "object",
@@ -620,6 +687,12 @@ class SDRMCPServer:
                                 "description": "Decoding duration in seconds; 0 runs until stopped",
                                 "default": 0,
                                 "minimum": 0,
+                            },
+                            "engine": {
+                                "type": "string",
+                                "enum": ["auto", "native", "multimon"],
+                                "description": "Decoder engine: built-in (default) or external rtl_fm + multimon-ng",
+                                "default": "auto",
                             },
                         }
                     }
@@ -677,6 +750,18 @@ class SDRMCPServer:
                                 "default": 15,
                                 "minimum": 1,
                             },
+                            "dwell_time": {
+                                "type": "number",
+                                "description": "Seconds to listen per step with max-hold (pager bursts are short); 0.2-10",
+                                "default": 1.0,
+                                "minimum": 0.2,
+                                "maximum": 10,
+                            },
+                            "gain": {
+                                "type": "number",
+                                "description": "Tuner gain in dB while scanning (restored afterwards)",
+                                "default": 40,
+                            },
                         }
                     },
                     outputSchema=_output_schema(bands_scanned="array", candidates="array"),
@@ -684,9 +769,9 @@ class SDRMCPServer:
                 Tool(
                     name="marine_track_vessels",
                     description=(
-                        "Start tracking ships via AIS (161.975 and 162.025 MHz, both channels) using "
-                        "AIS-catcher or rtl_ais plus pyais. Takes exclusive control of the RTL-SDR "
-                        "until marine_stop_tracking. Needs a coastal or waterway location."
+                        "Start tracking ships via AIS (161.975 and 162.025 MHz, both channels) with the "
+                        "built-in receiver (no extra software). Runs until marine_stop_tracking or the "
+                        "duration ends. Needs a coastal or waterway location."
                     ),
                     inputSchema={
                         "type": "object",
@@ -701,6 +786,12 @@ class SDRMCPServer:
                                 "description": "Tracking duration in seconds; 0 runs until stopped",
                                 "default": 0,
                                 "minimum": 0,
+                            },
+                            "engine": {
+                                "type": "string",
+                                "enum": ["auto", "native", "external"],
+                                "description": "Receiver: built-in (default) or external AIS-catcher / rtl_ais",
+                                "default": "auto",
                             },
                         }
                     }
@@ -785,11 +876,11 @@ class SDRMCPServer:
                             },
                             "latitude": {
                                 "type": "number",
-                                "description": "Observer latitude in decimal degrees (falls back to AETHERLINK_LATITUDE)",
+                                "description": "Optional override of the observer latitude; normally auto-detected",
                             },
                             "longitude": {
                                 "type": "number",
-                                "description": "Observer longitude in decimal degrees (falls back to AETHERLINK_LONGITUDE)",
+                                "description": "Optional override of the observer longitude; normally auto-detected",
                             },
                             "altitude_m": {
                                 "type": "number",
@@ -1036,9 +1127,9 @@ class SDRMCPServer:
                     self.sdr = None
 
                 if device_type == "rtlsdr":
-                    if not RTLSDR_AVAILABLE:
+                    if not RTLSDR_AVAILABLE and not self._mock_mode():
                         raise SDRError(f"RTL-SDR support is unavailable: {RTLSDR_IMPORT_ERROR}. {RTLSDR_INSTALL_HINT}")
-                    device: SDRDevice = RTLSDRDevice(device_index)
+                    device: SDRDevice = self._new_rtlsdr(device_index)
                 elif device_type == "hackrf":
                     if not HACKRF_AVAILABLE:
                         raise SDRError(f"HackRF support is unavailable: {HACKRF_IMPORT_ERROR}. {HACKRF_INSTALL_HINT}")
@@ -1087,7 +1178,7 @@ class SDRMCPServer:
                 return _text("Disconnected from SDR" + (f" (stopped {', '.join(stopped)})" if stopped else ""))
 
             elif name == "sdr_set_frequency":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 freq = float(arguments["frequency"])
                 try:
                     await sdr.set_frequency(freq)
@@ -1096,7 +1187,7 @@ class SDRMCPServer:
                 return _text(f"Set frequency to {freq/1e6:.3f} MHz")
 
             elif name == "sdr_set_gain":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 gain = arguments["gain"]
                 try:
                     await sdr.set_gain(gain)
@@ -1115,7 +1206,8 @@ class SDRMCPServer:
 
             elif name == "sdr_list_devices":
                 devices = await asyncio.to_thread(
-                    lambda: RTLSDRDevice.list_devices() + HackRFDevice.list_devices()
+                    lambda: (MockRTLSDRDevice.list_devices() if self._mock_mode() else RTLSDRDevice.list_devices())
+                    + HackRFDevice.list_devices()
                 )
                 connected = None
                 if self.sdr:
@@ -1148,7 +1240,7 @@ class SDRMCPServer:
                 }
 
             elif name == "sdr_set_sample_rate":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 self._require_capture_idle()
                 rate = float(arguments["sample_rate"])
                 try:
@@ -1158,7 +1250,7 @@ class SDRMCPServer:
                 return _text(f"Set sample rate to {rate/1e6:.3f} Msps")
 
             elif name == "sdr_set_ppm":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 ppm = int(arguments["ppm"])
                 try:
                     await sdr.set_freq_correction(ppm)
@@ -1167,7 +1259,7 @@ class SDRMCPServer:
                 return _text(f"Set frequency correction to {ppm} ppm")
 
             elif name == "sdr_set_bias_tee":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 enabled = bool(arguments.get("enabled", True))
                 try:
                     await sdr.set_bias_tee(enabled)
@@ -1186,33 +1278,42 @@ class SDRMCPServer:
                     )
                 self._require_device_free()
 
-                gain = arguments.get("gain", 40)
+                gain_arg = arguments.get("gain")
+                gain = ADSB_DEFAULT_GAIN if gain_arg is None else float(gain_arg)
                 duration_arg = arguments.get("duration", 120)
                 duration = 120 if duration_arg is None else int(duration_arg)
                 aggressive = bool(arguments.get("aggressive", True))
                 fix_crc = bool(arguments.get("fix_crc", True))
-                rx_lat, rx_lon = self._receiver_location(arguments)
+                engine = str(arguments.get("engine", "auto") or "auto").lower()
+                if engine not in ("auto", "dump1090", "rtl_adsb"):
+                    raise SDRError("engine must be auto, dump1090 or rtl_adsb")
+                engines = self._adsb_engines(engine)   # raises with install hints if nothing is available
+                location = await self._receiver_location(arguments)
                 try:
-                    self.adsb_decoder.set_receiver_location(rx_lat, rx_lon)
+                    if location:
+                        self.adsb_decoder.set_receiver_location(location.latitude, location.longitude, location.source)
+                    else:
+                        self.adsb_decoder.set_receiver_location(None, None)
                 except ValueError as e:
                     raise SDRError(str(e))
 
                 await self._start_task(
                     "adsb",
                     self._adsb_decoder_task(gain=str(gain), duration=duration,
-                                            aggressive=aggressive, fix_crc=fix_crc),
+                                            aggressive=aggressive, fix_crc=fix_crc, engines=engines),
                     "Failed to start ADS-B tracking",
                 )
                 duration_msg = "until stopped" if duration <= 0 else f"for {duration} seconds"
-                if rx_lat is not None:
-                    location_msg = f"Receiver location: {rx_lat:.4f}, {rx_lon:.4f} (distances and single-frame positions enabled)\n"
+                if location:
+                    location_msg = f"Receiver: {location.label()}\n"
                 else:
                     location_msg = (
-                        "Tip: pass receiver_latitude/receiver_longitude (or set AETHERLINK_LATITUDE and "
-                        "AETHERLINK_LONGITUDE) to get distances and faster position fixes.\n"
+                        "Receiver location unknown (no network); it will be estimated from aircraft "
+                        "positions as they arrive.\n"
                     )
+                engine_msg = engines[0] + (f" (falls back to {engines[1]} if it hears nothing)" if len(engines) > 1 else "")
                 return _text(
-                    "Started ADS-B aircraft tracking on 1090 MHz with dump1090\n"
+                    f"Started ADS-B aircraft tracking on 1090 MHz with {engine_msg}\n"
                     f"Gain: {gain} dB | Duration: {duration_msg}\n"
                     + location_msg +
                     "\nNOTE: Python SDR control is paused while tracking.\n"
@@ -1248,11 +1349,15 @@ class SDRMCPServer:
                 have_receiver = self.adsb_decoder.receiver_lat is not None
                 structured = {
                     "active": decoder_active,
+                    "engine": self.adsb_engine,
                     "statistics": stats,
                     "aircraft": _json_safe(aircraft_list),
                 }
 
-                summary = f"ADS-B Aircraft Tracker ({'active' if decoder_active else 'stopped'})\n"
+                engine_note = f", {self.adsb_engine}" if self.adsb_engine else ""
+                summary = f"ADS-B Aircraft Tracker ({'active' if decoder_active else 'stopped'}{engine_note})\n"
+                if self.adsb_engine_note:
+                    summary += f"{self.adsb_engine_note}\n"
                 summary += (
                     f"Raw messages: {stats['raw_messages']} | Decoded: {stats['decoded_messages']} | "
                     f"Position fixes: {stats['positions_decoded']}\n"
@@ -1267,9 +1372,11 @@ class SDRMCPServer:
                     f"{stats['climbing']} climbing | {stats['descending']} descending\n"
                 )
                 if have_receiver:
+                    acc = self.adsb_decoder.receiver_accuracy_km
                     summary += (
                         f"Receiver: {self.adsb_decoder.receiver_lat:.4f}, "
-                        f"{self.adsb_decoder.receiver_lon:.4f} (nearest first)\n"
+                        f"{self.adsb_decoder.receiver_lon:.4f} [{self.adsb_decoder.receiver_source}"
+                        f"{f', ±{acc:.0f} km' if acc else ''}] (nearest first)\n"
                     )
                 summary += "\n"
 
@@ -1324,9 +1431,8 @@ class SDRMCPServer:
 
                 if not have_receiver:
                     summary += (
-                        "\nPositions need an even+odd frame pair within 10 s. Give aviation_track_aircraft a "
-                        "receiver_latitude/longitude (or set AETHERLINK_LATITUDE/LONGITUDE) to decode from single "
-                        "frames and show distance.\n"
+                        "\nReceiver location not known yet, so positions need an even+odd frame pair; "
+                        "it is estimated automatically once a few aircraft have been placed.\n"
                     )
                 summary += "\nLive tracking links:\n"
                 for aircraft in aircraft_list[:15]:
@@ -1343,16 +1449,20 @@ class SDRMCPServer:
             elif name == "pager_start_decoding":
                 if self._task_running("pocsag"):
                     return _text("POCSAG decoding already active")
-                self._require_device_free()
+                engine = str(arguments.get("engine", "auto") or "auto").lower()
+                if engine not in ("auto", "native", "multimon"):
+                    raise SDRError("engine must be auto, native or multimon")
 
                 frequency = arguments.get("frequency")
                 if frequency is None:
-                    if self.sdr:
+                    if self.sdr and self.pocsag_decoder.frequency:
+                        frequency = self.pocsag_decoder.frequency
+                    elif self.sdr:
                         frequency = self.sdr.frequency
                     else:
                         raise SDRError(
-                            "Provide a pager frequency in Hz (e.g. 152240000), or connect the SDR "
-                            "and tune it first."
+                            "Provide a pager frequency in Hz (e.g. 152240000). pager_find_frequencies "
+                            "can locate active channels."
                         )
                 frequency = float(frequency)
                 if not (RTLSDR_MIN_FREQ <= frequency <= RTLSDR_MAX_FREQ):
@@ -1365,21 +1475,37 @@ class SDRMCPServer:
                         raise SDRError(f"baud_rate must be one of {POCSAG_BAUD_RATES}")
                 gain = arguments.get("gain", 40)
                 duration = int(arguments.get("duration", 0) or 0)
-
                 self.pocsag_decoder.baud_rate = baud_rate
-                await self._start_task(
-                    "pocsag",
-                    self._pocsag_decoder_task(frequency, gain, duration, baud_rate),
-                    "Failed to start POCSAG decoding",
-                )
+
+                if engine == "multimon":
+                    self._require_device_free()
+                    await self._start_task(
+                        "pocsag",
+                        self._pocsag_decoder_task(frequency, gain, duration, baud_rate),
+                        "Failed to start POCSAG decoding",
+                    )
+                    engine_label = "rtl_fm + multimon-ng (external)"
+                    note = "NOTE: Python SDR control is paused while decoding. Use pager_stop_decoding to regain it."
+                else:
+                    if self.sdr_lease:
+                        raise self._lease_error()
+                    self._require_capture_idle()
+                    await self._start_task(
+                        "pocsag",
+                        self._pocsag_native_task(frequency, gain, duration, baud_rate),
+                        "Failed to start POCSAG decoding",
+                        startup_wait=1.5,
+                    )
+                    engine_label = "built-in decoder"
+                    note = "Other capture tools (spectrum, recording) wait until pager_stop_decoding."
                 bauds = str(baud_rate) if baud_rate else "512, 1200 and 2400 (auto)"
                 duration_msg = "until stopped" if duration <= 0 else f"for {duration} seconds"
                 return _text(
-                    "Started POCSAG pager decoding with rtl_fm + multimon-ng\n"
-                    f"Frequency: {frequency/1e6:.4f} MHz | Baud: {bauds} | Gain: {gain} dB | "
+                    f"Started POCSAG pager decoding ({engine_label})\n"
+                    f"Frequency: {frequency/1e6:.4f} MHz | Baud: {bauds} | Gain: {gain} | "
                     f"Duration: {duration_msg}\n\n"
-                    "Pager traffic is bursty; wait a few minutes, then use pager_get_messages.\n"
-                    "NOTE: Python SDR control is paused while decoding. Use pager_stop_decoding to regain it."
+                    "Pager traffic is bursty; wait a few minutes, then use pager_get_messages. "
+                    "It also reports whether a signal is present on the channel.\n" + note
                 )
 
             elif name == "pager_stop_decoding":
@@ -1394,9 +1520,21 @@ class SDRMCPServer:
                 messages = self.pocsag_decoder.get_messages(max_age_seconds=max_age or None, limit=limit)
                 active = self._task_running("pocsag")
 
-                result = f"POCSAG Pager Decoder ({'active' if active else 'stopped'})\n"
+                result = f"POCSAG Pager Decoder ({'active' if active else 'stopped'}"
+                result += f", {stats['engine']})\n" if stats.get("engine") else ")\n"
                 if stats["frequency_MHz"]:
                     result += f"Frequency: {stats['frequency_MHz']:.4f} MHz\n"
+                demod = self.pocsag_demod
+                if demod is not None:
+                    ds = demod.stats()
+                    locked = [b for b, d in ds["decoders"].items() if d["batches"]]
+                    result += (
+                        f"Channel signal: {'present' if ds['signal_present'] else 'none right now'} | "
+                        f"carrier offset: {ds['afc_hz']:+d} Hz | "
+                        f"batches decoded: {sum(d['batches'] for d in ds['decoders'].values())}"
+                        + (f" at {', '.join(locked)} baud" if locked else "") + "\n"
+                    )
+                    stats = dict(stats, signal=ds)
                 result += f"Messages decoded: {stats['total_messages']} "
                 result += f"({stats['alpha_messages']} alpha, {stats['numeric_messages']} numeric, "
                 result += f"{stats['tone_only_pages']} tone-only)\n"
@@ -1423,7 +1561,7 @@ class SDRMCPServer:
                 return _text(result), {"active": active, "statistics": stats, "messages": messages}
 
             elif name == "pager_find_frequencies":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 self._require_capture_idle()
 
                 bands = arguments.get("bands") or list(PAGER_BANDS)
@@ -1433,50 +1571,77 @@ class SDRMCPServer:
                 min_snr = float(arguments.get("min_snr", 10) or 10)
                 max_results = int(arguments.get("max_results", 15) or 15)
 
+                dwell_arg = arguments.get("dwell_time")
+                dwell = 1.0 if dwell_arg is None else float(dwell_arg)
+                if not (0.2 <= dwell <= 10.0):
+                    raise SDRError("dwell_time must be between 0.2 and 10 seconds")
+
+                gain_arg = arguments.get("gain", 40)
                 original_freq = sdr.frequency
+                original_gain = sdr.gain
                 span = 0.9 * sdr.sample_rate
                 candidates: Dict[int, Dict[str, Any]] = {}
                 scanned: List[Dict[str, Any]] = []
+                analyzer = self.spectrum_analyzer
+                if gain_arg is not None:
+                    try:
+                        await sdr.set_gain(gain_arg)   # narrowband pagers need real tuner gain, not AGC
+                    except Exception as e:
+                        logger.debug(f"pager_find_frequencies: could not set gain {gain_arg}: {e}")
+                segment = int(sdr.sample_rate * 0.1)   # 100 ms slices: a pager burst fills at least one
                 try:
                     for band in bands:
                         for start, stop in PAGER_BANDS[band]:
                             if hasattr(sdr, "max_frequency") and stop > sdr.max_frequency:
                                 continue
-                            scanned.append({"band": band, "start_hz": start, "stop_hz": stop})
-                            try:
-                                points = await self.frequency_scanner.scan_range(
-                                    sdr, start + span / 2, stop + span / 2, span, 0.1
-                                )
-                            except ValueError as e:
-                                raise SDRError(str(e))
-                            for point in points:
-                                for sig in point["signals"]:
-                                    f_hz = sig["frequency"]
+                            scanned.append({"band": band, "start_hz": start, "stop_hz": stop, "dwell_s": dwell})
+                            center = start + span / 2
+                            while center - span / 2 < stop:
+                                try:
+                                    await sdr.set_frequency(center)
+                                except ValueError as e:
+                                    raise SDRError(str(e))
+                                await asyncio.sleep(0.05)
+                                samples = await sdr.read_samples(int(sdr.sample_rate * dwell))
+                                # Max-hold across short slices so brief bursts are kept, not averaged away
+                                hold = None
+                                freqs = None
+                                for i in range(0, len(samples) - segment + 1, segment):
+                                    freqs, pdb = analyzer.compute_psd(samples[i:i + segment], sdr.sample_rate)
+                                    hold = pdb if hold is None else np.maximum(hold, pdb)
+                                if hold is None:
+                                    center += span
+                                    continue
+                                for sig in analyzer.detect_signals(freqs, hold, center):
+                                    f_hz = sig.frequency
                                     if not (start <= f_hz <= stop):
                                         continue
-                                    if sig["snr"] < min_snr or sig["bandwidth"] > 60e3:
+                                    if sig.snr < min_snr or sig.bandwidth > 60e3:
                                         continue
                                     key = int(round(f_hz / 2500.0))  # 2.5 kHz grid
                                     f_round = key * 2500.0
                                     entry = candidates.get(key)
-                                    if entry is None or sig["power"] > entry["power_db"]:
+                                    if entry is None or sig.power > entry["power_db"]:
                                         candidates[key] = {
                                             "frequency_hz": f_round,
                                             "frequency_mhz": round(f_round / 1e6, 4),
-                                            "power_db": round(sig["power"], 1),
-                                            "snr_db": round(sig["snr"], 1),
-                                            "bandwidth_hz": int(round(sig["bandwidth"])),
+                                            "power_db": round(float(sig.power), 1),
+                                            "snr_db": round(float(sig.snr), 1),
+                                            "bandwidth_hz": int(round(sig.bandwidth)),
                                             "band": band,
                                         }
+                                center += span
                 finally:
                     try:
                         await sdr.set_frequency(original_freq)
+                        if gain_arg is not None:
+                            await sdr.set_gain(original_gain)
                     except Exception:
                         pass
 
                 ranked = sorted(candidates.values(), key=lambda c: c["power_db"], reverse=True)[:max_results]
                 scanned_str = ", ".join(f"{b['start_hz']/1e6:.1f}-{b['stop_hz']/1e6:.1f} MHz" for b in scanned)
-                result = f"Pager frequency finder: scanned {scanned_str}\n"
+                result = f"Pager frequency finder: scanned {scanned_str} ({dwell:g} s max-hold per step)\n"
                 result += f"Narrowband carriers (<60 kHz) with SNR >= {min_snr:g} dB, strongest first\n\n"
                 if not ranked:
                     result += (
@@ -1507,22 +1672,34 @@ class SDRMCPServer:
                         "pyais is not installed. Install with: pip install pyais "
                         "(or pip install 'aetherlink[decoders]')"
                     )
-                self._require_device_free()
-
+                engine = str(arguments.get("engine", "auto") or "auto").lower()
+                if engine not in ("auto", "native", "external"):
+                    raise SDRError("engine must be auto, native or external")
                 gain = arguments.get("gain", 40)
                 duration = int(arguments.get("duration", 0) or 0)
-                receiver, _ = self._build_ais_command(gain)  # raises if no receiver installed
-                await self._start_task(
-                    "ais",
-                    self._ais_decoder_task(gain, duration),
-                    "Failed to start AIS tracking",
-                )
+
+                if engine == "external":
+                    self._require_device_free()
+                    receiver, _ = self._build_ais_command(gain)  # raises if no receiver installed
+                    await self._start_task("ais", self._ais_decoder_task(gain, duration), "Failed to start AIS tracking")
+                    engine_label = f"{receiver} (external)"
+                    note = "NOTE: Python SDR control is paused while tracking. Use marine_stop_tracking to regain it."
+                else:
+                    if self.sdr_lease:
+                        raise self._lease_error()
+                    self._require_capture_idle()
+                    await self._start_task(
+                        "ais", self._ais_native_task(gain, duration), "Failed to start AIS tracking",
+                        startup_wait=1.5,
+                    )
+                    engine_label = "built-in receiver"
+                    note = "Other capture tools (spectrum, recording) wait until marine_stop_tracking."
                 duration_msg = "until stopped" if duration <= 0 else f"for {duration} seconds"
                 return _text(
-                    f"Started AIS vessel tracking with {receiver} on 161.975 / 162.025 MHz\n"
-                    f"Gain: {gain} dB | Duration: {duration_msg}\n\n"
-                    "Use marine_get_vessels to see tracked ships.\n"
-                    "NOTE: Python SDR control is paused while tracking. Use marine_stop_tracking to regain it."
+                    f"Started AIS vessel tracking ({engine_label}) on 161.975 and 162.025 MHz\n"
+                    f"Gain: {gain} | Duration: {duration_msg}\n\n"
+                    "Use marine_get_vessels to see tracked ships; it also reports how many bursts were heard.\n"
+                    + note
                 )
 
             elif name == "marine_stop_tracking":
@@ -1536,7 +1713,18 @@ class SDRMCPServer:
                 stats = self.ais_decoder.get_statistics(max_age_seconds=max_age)
                 active = self._task_running("ais")
 
-                result = f"AIS Vessel Tracker ({'active' if active else 'stopped'})\n"
+                result = f"AIS Vessel Tracker ({'active' if active else 'stopped'}"
+                result += f", {self.ais_decoder.engine})\n" if getattr(self.ais_decoder, "engine", None) else ")\n"
+                if self.ais_receiver is not None:
+                    rs = self.ais_receiver.stats()
+                    bursts = sum(c["bursts"] for c in rs["channels"].values())
+                    frames = sum(c["frames"] for c in rs["channels"].values())
+                    bad = sum(c["crc_errors"] for c in rs["channels"].values())
+                    result += (
+                        f"Bursts heard: {bursts} | Frames: {frames} | CRC failures: {bad} | "
+                        f"carrier offset: {rs['frequency_error_hz']:+d} Hz\n"
+                    )
+                    stats = dict(stats, receiver=rs)
                 result += f"NMEA sentences: {stats['nmea_sentences']} | Decoded messages: {stats['total_messages']}"
                 if stats["decode_errors"]:
                     result += f" | Decode errors: {stats['decode_errors']}"
@@ -1683,12 +1871,13 @@ class SDRMCPServer:
                 satellite = arguments.get("satellite", "METEOR-M2-4")
                 if satellite not in NORAD_IDS:
                     raise SDRError(f"Unknown satellite {satellite}. Known: {', '.join(NORAD_IDS)}")
-                lat, lon = self._receiver_location(arguments)
-                if lat is None:
+                location = await self._receiver_location(arguments)
+                if location is None:
                     raise SDRError(
-                        "Provide latitude and longitude in decimal degrees, or set the "
-                        f"{LOCATION_ENV[0]} and {LOCATION_ENV[1]} environment variables."
+                        "Could not determine the receiver location automatically (no network access). "
+                        "Pass latitude and longitude in decimal degrees."
                     )
+                lat, lon = location.latitude, location.longitude
                 altitude_m = float(arguments.get("altitude_m", 0) or 0)
                 hours = float(arguments.get("hours", 24) or 24)
                 min_elevation = float(arguments.get("min_elevation", 20) or 0)
@@ -1704,7 +1893,7 @@ class SDRMCPServer:
 
                 sat_info = self.meteor_decoder.get_satellite_info(satellite) or {}
                 result = (
-                    f"{satellite} passes over {lat:.4f}, {lon:.4f} in the next {hours:g} h "
+                    f"{satellite} passes over {location.label()} in the next {hours:g} h "
                     f"(peak elevation >= {min_elevation:g}°)\n"
                 )
                 result += f"Orbital elements: {info['tle_name']} via {info['tle_source']}, {info['tle_age_hours']} h old\n"
@@ -1737,14 +1926,15 @@ class SDRMCPServer:
                     )
                 return _text(result), {
                     "satellite": satellite,
-                    "observer": {"latitude": lat, "longitude": lon, "altitude_m": altitude_m},
+                    "observer": {"latitude": lat, "longitude": lon, "altitude_m": altitude_m,
+                                 "source": location.source, "description": location.description},
                     "elements": info,
                     "passes": pass_dicts,
                 }
 
             # ---------------------------------------------------------- analysis
             elif name == "spectrum_analyze":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 self._require_capture_idle()
 
                 fft_size = int(arguments.get("fft_size", 2048))
@@ -1764,10 +1954,9 @@ class SDRMCPServer:
                 if not averaging:
                     self.spectrum_analyzer.reset_averaging()
 
-                samples = await sdr.read_samples(fft_size * 2)
-                frame = await self.spectrum_analyzer.analyze_spectrum(
-                    samples[:fft_size], sdr.sample_rate, sdr.frequency
-                )
+                # 16 segments of fft_size are Welch-averaged (16 ms at 2.048 Msps for 2048 bins)
+                samples = await sdr.read_samples(fft_size * 16)
+                frame = await self.spectrum_analyzer.analyze_spectrum(samples, sdr.sample_rate, sdr.frequency)
 
                 result = f"Spectrum Analysis at {frame.center_freq/1e6:.3f} MHz\n"
                 result += f"Span: {sdr.sample_rate/1e6:.3f} MHz | FFT: {fft_size} | Window: {window}\n"
@@ -1809,7 +1998,7 @@ class SDRMCPServer:
                 }
 
             elif name == "spectrum_scan":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 self._require_capture_idle()
 
                 start_freq = float(arguments["start_freq"])
@@ -1852,7 +2041,7 @@ class SDRMCPServer:
 
             # ---------------------------------------------------------- recording
             elif name == "recording_start":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 if self._task_running("recorder") or self.signal_recorder.is_recording:
                     raise SDRError(
                         f"An IQ recording is already in progress ({self.signal_recorder.recording_metadata.get('id')}). "
@@ -1886,7 +2075,7 @@ class SDRMCPServer:
                 return _text(result)
 
             elif name == "audio_record_start":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 if self._task_running("audio_recorder") or self.audio_recorder.is_recording:
                     raise SDRError(
                         f"An audio recording is already in progress ({self.audio_recorder.recording_metadata.get('id')}). "
@@ -1928,7 +2117,7 @@ class SDRMCPServer:
 
             # ---------------------------------------------------------- HackRF TX
             elif name == "hackrf_set_tx_gain":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 if not isinstance(sdr, HackRFDevice):
                     raise SDRError("This command requires a HackRF device")
                 gain = int(arguments["gain"])
@@ -1939,7 +2128,7 @@ class SDRMCPServer:
                 return _text(f"Set HackRF TX gain to {gain} dB")
 
             elif name == "signal_generator":
-                sdr = self._require_sdr()
+                sdr = await self._ensure_sdr()
                 if not isinstance(sdr, HackRFDevice):
                     raise SDRError("Signal generation requires a HackRF device")
                 self._require_capture_idle()
@@ -2142,100 +2331,78 @@ class SDRMCPServer:
 
     # ====================================================================== background tasks
 
+    _dump1090_adaptive: Optional[bool] = None
+
+    async def _dump1090_supports_adaptive_gain(self, path: str) -> bool:
+        """dump1090-fa 7.2+ has adaptive gain; other dump1090 builds reject the flags."""
+        if self._dump1090_adaptive is None:
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    path, "--help", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+                )
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                self._dump1090_adaptive = b"--adaptive-range" in out and b"--adaptive-burst" in out
+            except Exception:
+                self._dump1090_adaptive = False
+                if proc is not None and proc.returncode is None:
+                    # A build that treats --help as "start receiving" must not be left running
+                    await self._terminate(proc, "dump1090 --help probe")
+        return self._dump1090_adaptive
+
+    def _adsb_engines(self, engine: str) -> List[str]:
+        """Resolve which ADS-B receiver programs to use, in order."""
+        have_dump1090 = shutil.which("dump1090") is not None
+        have_rtl_adsb = shutil.which("rtl_adsb") is not None
+        if engine == "dump1090":
+            if not have_dump1090:
+                raise SDRError(f"dump1090 not found on PATH. Install with: {DUMP1090_HINT}")
+            return ["dump1090"]
+        if engine == "rtl_adsb":
+            if not have_rtl_adsb:
+                raise SDRError(f"rtl_adsb not found on PATH. {RTL_ADSB_HINT}")
+            return ["rtl_adsb"]
+        order = [name for name, ok in (("dump1090", have_dump1090), ("rtl_adsb", have_rtl_adsb)) if ok]
+        if not order:
+            raise SDRError(f"No ADS-B receiver found. {RTL_ADSB_HINT}; or {DUMP1090_HINT}")
+        return order
+
     async def _adsb_decoder_task(
         self,
         gain: str = "40",
         duration: int = 120,
         aggressive: bool = True,
         fix_crc: bool = True,
+        engines: Optional[List[str]] = None,
     ):
-        """Background task for ADS-B decoding using dump1090 raw TCP output.
+        """Background task for ADS-B decoding with dump1090 (raw TCP output) or rtl_adsb (stdout).
 
-        Releases the Python SDR connection so dump1090 can open the device, and
-        reconnects it with the previous settings when done.
+        Releases the Python SDR connection so the receiver can open the device, and
+        reconnects it with the previous settings when done. In auto mode, if the first
+        engine hears nothing for ADSB_FALLBACK_AFTER_S the next one is tried.
         """
-        logger.info("Starting ADS-B decoder with dump1090 subprocess")
+        engines = engines or ["dump1090"]
+        logger.info(f"Starting ADS-B decoder (engines: {', '.join(engines)})")
         await self._release_sdr("adsb")
-
-        process = None
-        writer = None
-        pump = None
-        stderr_tail: Deque[str] = deque(maxlen=30)
+        self.adsb_engine_note = None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration if duration and duration > 0 else None
         try:
-            # Homebrew packages FlightAware dump1090 as dump1090-fa; the binary is dump1090.
-            dump1090_path = find_binary("dump1090", DUMP1090_HINT)
-            cmd = [dump1090_path, "--net", "--gain", str(gain), "--quiet"]
-            device_index = self._device_index()
-            if device_index:
-                cmd.extend(["--device-index", str(device_index)])
-            if fix_crc:
-                cmd.append("--fix")
-            if aggressive:
-                cmd.append("--aggressive")
-            logger.info(f"Starting dump1090: {' '.join(cmd)}")
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            pump = asyncio.create_task(self._pump_lines(process.stderr, "dump1090", stderr_tail))
-            logger.info(f"dump1090 started (PID: {process.pid})")
-
-            # dump1090 needs a moment before the raw TCP port is ready.
-            reader = None
-            for _ in range(20):
-                if process.returncode is not None:
-                    raise RuntimeError(
-                        f"dump1090 exited with code {process.returncode}: {self._tail_text(stderr_tail)}"
+            for index, engine in enumerate(engines):
+                self.adsb_engine = engine
+                fallback_allowed = index + 1 < len(engines)
+                outcome, raw = await self._run_adsb_engine(engine, gain, aggressive, fix_crc, deadline, fallback_allowed)
+                if outcome == "no_frames" and fallback_allowed:
+                    self.adsb_engine_note = (
+                        f"{engine} received no frames for {ADSB_FALLBACK_AFTER_S:.0f} s; switched to {engines[index + 1]}."
                     )
-                try:
-                    reader, writer = await asyncio.open_connection("127.0.0.1", ADSB_RAW_PORT)
-                    break
-                except OSError:
-                    await asyncio.sleep(0.5)
-            if reader is None:
-                raise RuntimeError(
-                    f"Could not connect to dump1090 raw output on 127.0.0.1:{ADSB_RAW_PORT}. "
-                    f"{self._tail_text(stderr_tail)}"
-                )
-
-            loop = asyncio.get_running_loop()
-            msg_count = 0
-            decode_count = 0
-            last_log_time = loop.time()
-            deadline = loop.time() + duration if duration and duration > 0 else None
-
-            while True:
-                if deadline and loop.time() >= deadline:
-                    logger.info("ADS-B tracking duration reached")
-                    break
-                if process.returncode is not None:
-                    logger.error(f"dump1090 exited with code {process.returncode}")
-                    break
-
-                try:
-                    line = await asyncio.wait_for(reader.readline(), timeout=2.0)
-                except asyncio.TimeoutError:
+                    logger.warning(self.adsb_engine_note)
                     continue
-                if not line:
-                    await asyncio.sleep(0.2)
+                if outcome == "exited" and fallback_allowed and raw == 0:
+                    self.adsb_engine_note = f"{engine} exited without receiving frames; switched to {engines[index + 1]}."
+                    logger.warning(self.adsb_engine_note)
                     continue
-
-                msg_line = line.decode(errors="replace").strip()
-                if msg_line.startswith('*') and msg_line.endswith(';'):
-                    msg_count += 1
-                    msg_hex = msg_line[1:-1]
-                    if len(msg_hex) == 28 and self.adsb_decoder.decode_message(msg_hex):
-                        decode_count += 1
-
-                if loop.time() - last_log_time > 10:
-                    logger.info(
-                        f"ADS-B: {msg_count} msgs, {decode_count} decoded, "
-                        f"{len(self.adsb_decoder.aircraft)} aircraft"
-                    )
-                    last_log_time = loop.time()
-
+                break
         except asyncio.CancelledError:
             logger.info("ADS-B tracking stopped by user")
             raise
@@ -2243,6 +2410,98 @@ class SDRMCPServer:
             logger.error(f"ADS-B decoder error: {e}")
             logger.debug(traceback.format_exc())
             raise
+        finally:
+            await self._restore_sdr()
+
+    async def _run_adsb_engine(self, engine: str, gain: str, aggressive: bool, fix_crc: bool,
+                               deadline: Optional[float], fallback_allowed: bool):
+        """Run one receiver program until the deadline. Returns (outcome, raw_frame_count)."""
+        loop = asyncio.get_running_loop()
+        process = None
+        writer = None
+        pump = None
+        stderr_tail: Deque[str] = deque(maxlen=30)
+        device_index = self._device_index()
+        msg_count = 0
+        decode_count = 0
+        try:
+            if engine == "dump1090":
+                path = find_binary("dump1090", DUMP1090_HINT)
+                cmd = [path, "--net", "--gain", str(gain), "--quiet"]
+                if device_index:
+                    cmd.extend(["--device", str(device_index)])  # dump1090-fa: index or serial
+                if fix_crc:
+                    cmd.append("--fix")
+                if aggressive:
+                    cmd.append("--aggressive")
+                if await self._dump1090_supports_adaptive_gain(path):
+                    # Let dump1090-fa back the gain off when strong bursts or a high noise floor appear
+                    cmd.extend(["--adaptive-burst", "--adaptive-range"])
+                logger.info(f"Starting dump1090: {' '.join(cmd)}")
+                process = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+                )
+                pump = asyncio.create_task(self._pump_lines(process.stderr, "dump1090", stderr_tail))
+                reader = None
+                for _ in range(20):
+                    if process.returncode is not None:
+                        raise RuntimeError(
+                            f"dump1090 exited with code {process.returncode}: {self._tail_text(stderr_tail)}"
+                        )
+                    try:
+                        reader, writer = await asyncio.open_connection("127.0.0.1", ADSB_RAW_PORT)
+                        break
+                    except OSError:
+                        await asyncio.sleep(0.5)
+                if reader is None:
+                    raise RuntimeError(
+                        f"Could not connect to dump1090 raw output on 127.0.0.1:{ADSB_RAW_PORT}. "
+                        f"{self._tail_text(stderr_tail)}"
+                    )
+            else:
+                path = find_binary("rtl_adsb", RTL_ADSB_HINT)
+                cmd = [path, "-g", str(gain), "-d", str(device_index)]
+                logger.info(f"Starting rtl_adsb: {' '.join(cmd)}")
+                process = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                pump = asyncio.create_task(self._pump_lines(process.stderr, "rtl_adsb", stderr_tail))
+                reader = process.stdout
+            logger.info(f"{engine} started (PID: {process.pid})")
+
+            started = loop.time()
+            last_log_time = started
+            while True:
+                now = loop.time()
+                if deadline and now >= deadline:
+                    logger.info("ADS-B tracking duration reached")
+                    return "duration", msg_count
+                if process.returncode is not None:
+                    logger.error(f"{engine} exited with code {process.returncode}: {self._tail_text(stderr_tail)}")
+                    return "exited", msg_count
+                if fallback_allowed and msg_count == 0 and now - started >= ADSB_FALLBACK_AFTER_S:
+                    return "no_frames", msg_count
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+                if not line:
+                    if process.returncode is not None:
+                        return "exited", msg_count
+                    await asyncio.sleep(0.2)
+                    continue
+                msg_line = line.decode(errors="replace").strip()
+                if msg_line.startswith('*') and msg_line.endswith(';'):
+                    msg_count += 1
+                    msg_hex = msg_line[1:-1]
+                    if len(msg_hex) == 28 and self.adsb_decoder.decode_message(msg_hex):
+                        decode_count += 1
+                if now - last_log_time > 10:
+                    logger.info(
+                        f"ADS-B ({engine}): {msg_count} msgs, {decode_count} decoded, "
+                        f"{len(self.adsb_decoder.aircraft)} aircraft"
+                    )
+                    last_log_time = now
         finally:
             if pump:
                 pump.cancel()
@@ -2252,8 +2511,7 @@ class SDRMCPServer:
                     await writer.wait_closed()
                 except Exception:
                     pass
-            await self._terminate(process, "dump1090")
-            await self._restore_sdr()
+            await self._terminate(process, engine)
 
     async def _pocsag_decoder_task(self, frequency: float, gain: Any, duration: int,
                                    baud_rate: Optional[int]):
@@ -2319,6 +2577,8 @@ class SDRMCPServer:
                     f"multimon-ng exited with code {multimon_proc.returncode}: {self._tail_text(mm_tail)}"
                 )
             self.pocsag_decoder.frequency = frequency
+            self.pocsag_decoder.engine = "multimon-ng"
+            self.pocsag_demod = None
             logger.info(f"POCSAG pipeline running (rtl_fm PID {rtl_fm_proc.pid}, multimon-ng PID {multimon_proc.pid})")
 
             loop = asyncio.get_running_loop()
@@ -2377,6 +2637,85 @@ class SDRMCPServer:
             await self._terminate(rtl_fm_proc, "rtl_fm")
             await self._restore_sdr()
 
+    async def _pocsag_native_task(self, frequency: float, gain: Any, duration: int,
+                                  baud_rate: Optional[int]):
+        """Built-in POCSAG decoding from the radio's own IQ stream (no external programs)."""
+        sdr = await self._ensure_sdr()
+        tune = frequency - POCSAG_TUNE_OFFSET_HZ
+        if hasattr(sdr, "min_frequency") and tune < sdr.min_frequency:
+            tune = frequency + POCSAG_TUNE_OFFSET_HZ
+        offset = frequency - tune
+        try:
+            await sdr.set_frequency(tune)
+            if gain is not None:
+                await sdr.set_gain(gain)
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        bauds = (baud_rate,) if baud_rate else POCSAG_BAUD_RATES
+        demod = POCSAGDemodulator(sdr.sample_rate, offset_hz=offset, bauds=bauds,
+                                  on_message=self._on_pocsag_message)
+        self.pocsag_demod = demod
+        self.pocsag_decoder.frequency = frequency
+        self.pocsag_decoder.engine = "built-in"
+        logger.info(f"POCSAG built-in decoder on {frequency/1e6:.4f} MHz (tuned {tune/1e6:.4f} MHz, offset {offset/1e3:+.0f} kHz)")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration if duration and duration > 0 else None
+        last_log = loop.time()
+        chunk = int(sdr.sample_rate * 0.2)
+        try:
+            async for samples in sdr.stream(chunk):
+                await asyncio.to_thread(demod.feed_iq, samples)
+                now = loop.time()
+                if deadline and now >= deadline:
+                    logger.info("POCSAG decoding duration reached")
+                    break
+                if now - last_log > 30:
+                    logger.info(f"POCSAG: {demod.stats()}")
+                    last_log = now
+        except asyncio.CancelledError:
+            logger.info("POCSAG decoding stopped by user")
+            raise
+        except Exception as e:
+            logger.error(f"POCSAG decoder error: {e}")
+            raise
+
+    async def _ais_native_task(self, gain: Any, duration: int):
+        """Built-in AIS reception of both channels from the radio's own IQ stream."""
+        sdr = await self._ensure_sdr()
+        center = AIS_CENTER_HZ + AIS_TUNE_OFFSET_HZ
+        try:
+            await sdr.set_frequency(center)
+            if gain is not None:
+                await sdr.set_gain(gain)
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        receiver = AISReceiver(sdr.sample_rate, on_sentence=self._on_ais_sentence, center_hz=center)
+        self.ais_receiver = receiver
+        self.ais_decoder.engine = "built-in"
+        logger.info(f"AIS built-in receiver (tuned {center/1e6:.4f} MHz)")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration if duration and duration > 0 else None
+        last_log = loop.time()
+        chunk = int(sdr.sample_rate * 0.2)
+        try:
+            async for samples in sdr.stream(chunk):
+                await asyncio.to_thread(receiver.feed_iq, samples)
+                now = loop.time()
+                if deadline and now >= deadline:
+                    logger.info("AIS tracking duration reached")
+                    break
+                if now - last_log > 30:
+                    logger.info(f"AIS: {receiver.stats()}")
+                    last_log = now
+        except asyncio.CancelledError:
+            logger.info("AIS tracking stopped by user")
+            raise
+        except Exception as e:
+            logger.error(f"AIS receiver error: {e}")
+            raise
+
     def _build_ais_command(self, gain: Any):
         """Pick an installed AIS receiver and build its command line."""
         device_index = self._device_index()
@@ -2408,6 +2747,8 @@ class SDRMCPServer:
         tail: Deque[str] = deque(maxlen=40)
         try:
             receiver, cmd = self._build_ais_command(gain)
+            self.ais_decoder.engine = receiver
+            self.ais_receiver = None
             logger.info(f"Starting {receiver}: {' '.join(cmd)}")
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -2585,7 +2926,8 @@ class SDRMCPServer:
         stderr_tail: Deque[str] = deque(maxlen=30)
         try:
             rtl_433_path = find_binary("rtl_433", RTL433_HINT)
-            cmd = [rtl_433_path, "-F", "json", "-d", str(self._device_index())]
+            # "-F log" keeps rtl_433's own diagnostics on stderr next to the JSON stream
+            cmd = [rtl_433_path, "-F", "json", "-F", "log", "-d", str(self._device_index())]
             for freq in self.rtl433_decoder.frequencies:
                 cmd.extend(["-f", f"{int(freq)}"])
             if len(self.rtl433_decoder.frequencies) > 1:
@@ -2616,11 +2958,15 @@ class SDRMCPServer:
                     break
 
                 json_line = line.decode(errors="replace").strip()
-                if json_line:
+                if json_line.startswith("{"):
                     device = self.rtl433_decoder.parse_message(json_line)
                     if device:
                         msg_count += 1
                         logger.debug(f"Decoded {device.model}: {self.rtl433_decoder.get_device_summary(device)}")
+                elif json_line:
+                    # With -F log, rtl_433 may print its own messages on stdout as well
+                    stderr_tail.append(json_line)
+                    logger.debug(f"rtl_433: {json_line}")
 
                 if loop.time() - last_log_time > 30:
                     stats = self.rtl433_decoder.get_statistics()

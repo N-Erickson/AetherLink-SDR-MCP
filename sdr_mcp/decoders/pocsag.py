@@ -58,6 +58,7 @@ class POCSAGDecoder:
         self.lines_seen = 0
         self.baud_rate: Optional[int] = None   # None = decode all rates
         self.frequency: Optional[float] = None
+        self.engine: Optional[str] = None      # native | multimon-ng
 
     # ------------------------------------------------------------ multimon-ng
 
@@ -86,6 +87,12 @@ class POCSAGDecoder:
             numeric=(message_type == "numeric"),
             message_type=message_type,
         )
+        self.messages.append(message)
+        self.message_count += 1
+        return message
+
+    def add_message(self, message: POCSAGMessage) -> POCSAGMessage:
+        """Store a message produced by the native decoder."""
         self.messages.append(message)
         self.message_count += 1
         return message
@@ -119,6 +126,7 @@ class POCSAGDecoder:
             'numeric_messages': sum(1 for m in messages if m.message_type == "numeric"),
             'tone_only_pages': sum(1 for m in messages if m.message_type == "tone"),
             'frequency_MHz': self.frequency / 1e6 if self.frequency else None,
+            'engine': self.engine,
         }
 
     def clear(self):

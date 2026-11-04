@@ -82,36 +82,43 @@ class SpectrumAnalyzer:
         else:
             return np.ones(size)  # Rectangular window
             
+    SCIPY_WINDOW_NAMES = {
+        'hamming': 'hamming', 'hann': 'hann', 'blackman': 'blackman',
+        'blackman-harris': 'blackmanharris', 'flattop': 'flattop',
+        'kaiser': ('kaiser', 8.6),
+    }
+
     def compute_psd(self, samples: np.ndarray,
                     sample_rate: float) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute Power Spectral Density"""
-        # Ensure we have the right number of samples
+        """Compute a Welch-averaged Power Spectral Density at fft_size resolution.
+
+        All available samples are split into fft_size segments (50% overlap),
+        windowed and averaged. Averaging many segments shrinks the per-bin
+        variance so one wideband transmission reads as one smooth hump instead
+        of hundreds of noisy peaks; a single FFT over a long capture would give
+        very fine bins with large variance and no averaging.
+        """
         num_samples = len(samples)
+        nperseg = int(min(self.fft_size, num_samples))
+        if nperseg < 8:
+            raise ValueError("Not enough samples for spectrum analysis")
+        window = self.SCIPY_WINDOW_NAMES.get(self.window_type, 'boxcar')
 
-        # Regenerate window if sample size changed
-        if num_samples != len(self.window):
-            self.window = self._get_window(self.window_type, num_samples)
-            self.fft_size = num_samples
+        freqs, pxx = signal.welch(
+            samples, fs=sample_rate, window=window, nperseg=nperseg,
+            noverlap=nperseg // 2, return_onesided=False, scaling='spectrum',
+            detrend=False,
+        )
+        freqs = fftshift(freqs)
+        power_db = 10 * np.log10(fftshift(pxx) + 1e-20)
 
-        # Apply window
-        windowed = samples * self.window
-
-        # Compute FFT
-        spectrum = fftshift(fft(windowed))
-
-        # Compute power in dB
-        power = np.abs(spectrum) ** 2
-        power_db = 10 * np.log10(power + 1e-10)
-
-        # Normalize for window power
-        window_power = np.sum(self.window ** 2)
-        power_db -= 10 * np.log10(window_power)
-
-        # Generate frequency array
-        freqs = fftshift(fftfreq(self.fft_size, 1/sample_rate))
+        # Keep the window/fft_size bookkeeping consistent with what was computed
+        if nperseg != self.fft_size:
+            self.fft_size = nperseg
+            self.window = self._get_window(self.window_type, nperseg)
 
         return freqs, power_db
-        
+
     def update_averaging(self, power_db: np.ndarray):
         """Update averaged spectrum and peak hold"""
         # Reset averaging buffers if size changed
@@ -130,57 +137,100 @@ class SpectrumAnalyzer:
         """Estimate noise floor using percentile method"""
         return np.percentile(power_db, percentile)
         
-    def detect_signals(self, freqs: np.ndarray, 
+    # Detection tuning
+    SMOOTHING_BINS = 9          # moving-average width applied before thresholding
+    DC_EXCLUDE_FRACTION = 0.0025  # interpolate across +/- this fraction of the span at center (RTL-SDR DC spike, ~5 kHz at 2.048 Msps)
+    MIN_SIGNAL_BINS = 2         # single-bin spikes are not signals
+    MERGE_GAP_BINS = 4          # gaps up to this many bins inside a signal are closed
+    NARROW_MARGIN_DB = 6        # raw bins this far above threshold count even if smoothing hides them
+    MAX_SIGNALS = 50
+
+    def detect_signals(self, freqs: np.ndarray,
                       power_db: np.ndarray,
                       center_freq: float) -> List[Signal]:
-        """Detect signals in spectrum"""
-        signals = []
-        
-        # Estimate noise floor
-        noise_floor = self.estimate_noise_floor(power_db)
+        """Detect signals as contiguous regions above the noise floor.
+
+        The PSD is smoothed first so one wideband transmission (an FM station,
+        a digital carrier) becomes a single detection rather than dozens of
+        noise peaks, and the bins around DC are ignored because zero-IF
+        receivers put a spurious spike there.
+        """
+        n = len(power_db)
+        if n == 0:
+            return []
+
+        # Zero-IF receivers put a spurious spike at DC. Replace those bins with a
+        # straight line between their neighbours so an isolated spike vanishes
+        # while a signal that straddles the center stays one contiguous detection.
+        work = power_db.astype(float).copy()
+        dc_bins = max(1, int(n * self.DC_EXCLUDE_FRACTION))
+        mid = n // 2
+        lo, hi = max(0, mid - dc_bins), min(n - 1, mid + dc_bins)
+        if hi > lo + 1 and lo > 0 and hi < n - 1:
+            work[lo:hi + 1] = np.linspace(work[lo - 1], work[hi + 1], hi - lo + 1)
+        power_db = work
+
+        # Edge-padded moving average (zero padding would lift the band edges)
+        half = self.SMOOTHING_BINS // 2
+        padded = np.pad(power_db, half, mode="edge")
+        kernel = np.ones(self.SMOOTHING_BINS) / self.SMOOTHING_BINS
+        smooth = np.convolve(padded, kernel, mode="valid")[:n]
+
+        noise_floor = self.estimate_noise_floor(smooth)
         threshold = noise_floor + self.signal_threshold_db
-        
-        # Find peaks
-        peaks, properties = signal.find_peaks(
-            power_db, 
-            height=threshold,
-            distance=10,  # Minimum distance between peaks
-            prominence=6   # Minimum prominence
-        )
-        
-        # Analyze each peak
-        for idx in peaks:
-            # Estimate bandwidth (3dB down points)
-            peak_power = power_db[idx]
-            freq = center_freq + freqs[idx]
-            
-            # Find 3dB bandwidth
-            left_idx = idx
-            right_idx = idx
-            cutoff = peak_power - 3
-            
-            while left_idx > 0 and power_db[left_idx] > cutoff:
-                left_idx -= 1
-            while right_idx < len(power_db)-1 and power_db[right_idx] > cutoff:
-                right_idx += 1
-                
-            bandwidth = freqs[right_idx] - freqs[left_idx]
+        # Smoothed PSD merges wideband signals; the raw PSD with an extra margin
+        # keeps narrow carriers that smoothing would dilute.
+        above = (smooth > threshold) | (power_db > threshold + self.NARROW_MARGIN_DB)
+
+        # Close small gaps so a signal with a dip in its envelope stays one detection
+        gap = self.MERGE_GAP_BINS
+        if gap > 0 and n > 2 * gap:
+            closed = above.copy()
+            idx = 0
+            while idx < n:
+                if above[idx]:
+                    idx += 1
+                    continue
+                run_start = idx
+                while idx < n and not above[idx]:
+                    idx += 1
+                if run_start > 0 and idx < n and (idx - run_start) <= gap:
+                    closed[run_start:idx] = True
+            above = closed
+
+        signals: List[Signal] = []
+        bin_hz = abs(freqs[1] - freqs[0]) if n > 1 else 0.0
+        idx = 0
+        while idx < n:
+            if not above[idx]:
+                idx += 1
+                continue
+            start = idx
+            while idx < n and above[idx]:
+                idx += 1
+            stop = idx  # exclusive
+            if stop - start < self.MIN_SIGNAL_BINS:
+                continue
+            segment = power_db[start:stop]
+            peak_rel = int(np.argmax(segment))
+            peak_power = float(segment[peak_rel])
+            # Power-weighted centroid gives a stable center for wideband signals
+            weights = np.power(10.0, (segment - peak_power) / 10.0)
+            centroid = float(np.sum(freqs[start:stop] * weights) / np.sum(weights))
+            bandwidth = float((stop - start) * bin_hz)
             snr = peak_power - noise_floor
-            
-            # Basic modulation hint based on bandwidth
-            modulation_hint = self._guess_modulation(bandwidth, snr)
-            
             signals.append(Signal(
-                frequency=freq,
+                frequency=center_freq + centroid,
                 power=peak_power,
                 bandwidth=bandwidth,
                 snr=snr,
-                modulation_hint=modulation_hint,
-                confidence=min(snr / 30, 1.0)  # Confidence based on SNR
+                modulation_hint=self._guess_modulation(bandwidth, snr),
+                confidence=min(snr / 30, 1.0),
             ))
-            
-        return signals
-        
+
+        signals.sort(key=lambda sig: sig.power, reverse=True)
+        return signals[:self.MAX_SIGNALS]
+
     def _guess_modulation(self, bandwidth: float, snr: float) -> str:
         """Guess modulation type based on bandwidth and SNR"""
         # This is a simplified heuristic
@@ -190,7 +240,9 @@ class SpectrumAnalyzer:
             return "NFM"
         elif bandwidth < 10000:  # Medium
             return "AM/NFM"
-        elif bandwidth < 200000:  # Wide
+        elif bandwidth < 40000:  # Narrowband voice/data channels (12.5-25 kHz)
+            return "NFM/Digital"
+        elif bandwidth < 300000:  # FM broadcast occupies ~200 kHz
             return "WFM"
         else:  # Very wide
             return "Digital/TV"

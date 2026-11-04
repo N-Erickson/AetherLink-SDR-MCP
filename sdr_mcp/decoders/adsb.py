@@ -49,6 +49,9 @@ class Aircraft:
 
 
 CPR_PAIR_MAX_AGE_S = 10.0  # even/odd frames must be this close to solve a global position
+RECEIVER_CHECK_KM = 300.0  # an IP-derived location farther than this from decoded aircraft is wrong
+MAX_ADSB_RANGE_KM = 450.0  # no RTL-SDR hears an aircraft farther away than this
+UNTRUSTED_SOURCES = {"ip-geolocation"}
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -79,18 +82,95 @@ class ADSBDecoder:
         self.position_count = 0
         self.receiver_lat: Optional[float] = None
         self.receiver_lon: Optional[float] = None
+        self.receiver_source: Optional[str] = None
+        self.receiver_trusted = False      # single-frame decoding only uses a trusted reference
+        self.receiver_accuracy_km: Optional[float] = None
+        self.auto_estimate = True          # estimate the receiver position from aircraft when unknown
+        self.on_receiver_estimate = None   # callback(lat, lon) when an estimate is adopted
+        self._pair_positions: Dict[str, tuple] = {}   # icao -> (lat, lon) from even/odd pairs
         # Latest even/odd CPR frames per aircraft: icao -> {"even": (hex, t), "odd": (hex, t)}
         self._cpr: Dict[str, Dict[str, Any]] = {}
 
-    def set_receiver_location(self, latitude: Optional[float], longitude: Optional[float]):
+    def set_receiver_location(self, latitude: Optional[float], longitude: Optional[float],
+                              source: Optional[str] = None):
         """Receiver position enables single-frame (local CPR) and surface position decoding."""
         if latitude is None or longitude is None:
             self.receiver_lat = self.receiver_lon = None
+            self.receiver_source = None
             return
         if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
             raise ValueError("Receiver latitude/longitude out of range")
         self.receiver_lat = float(latitude)
         self.receiver_lon = float(longitude)
+        self.receiver_source = source or "given"
+        self.receiver_trusted = self.receiver_source not in UNTRUSTED_SOURCES
+        self.receiver_accuracy_km = 25.0 if self.receiver_source in UNTRUSTED_SOURCES else None
+
+    def _check_receiver_against_aircraft(self):
+        """Adopt or confirm the receiver location using positions solved from frame pairs.
+
+        Pair-derived positions do not depend on any reference, so they are ground
+        truth for where the antenna can hear. An unknown receiver is estimated from
+        them; an IP-derived one is confirmed if it lies within range, or replaced
+        if it does not (VPNs and ISP routing put the IP address in the wrong city).
+        """
+        if not self.auto_estimate:
+            return
+        # A single aircraft impossibly far from an untrusted (IP/VPN) location disproves it at once
+        if self.receiver_lat is not None and not self.receiver_trusted:
+            farthest = max(
+                haversine_km(self.receiver_lat, self.receiver_lon, lat, lon)
+                for lat, lon in self._pair_positions.values()
+            )
+            if farthest > MAX_ADSB_RANGE_KM:
+                coarse = self.estimate_receiver_location(min_aircraft=1)
+                self._adopt_estimate(coarse, f"the {self.receiver_source} location was {farthest:.0f} km from a decoded aircraft",
+                                     coarse=len(self._pair_positions) < 3)
+                return
+        estimate = self.estimate_receiver_location()
+        if estimate is None:
+            return
+        if self.receiver_lat is None:
+            self._adopt_estimate(estimate, "no location was known")
+            return
+        if self.receiver_trusted and self.receiver_source == "adsb-estimate" and len(self._pair_positions) in (3, 6, 12):
+            self._adopt_estimate(estimate, "refined with more aircraft")  # better median as more aircraft arrive
+            return
+        if self.receiver_trusted:
+            return
+        distance = haversine_km(self.receiver_lat, self.receiver_lon, estimate[0], estimate[1])
+        if distance <= RECEIVER_CHECK_KM:
+            self.receiver_trusted = True
+            logger.info(f"Receiver location ({self.receiver_source}) confirmed by aircraft within {distance:.0f} km")
+        else:
+            self._adopt_estimate(estimate, f"the {self.receiver_source} location was {distance:.0f} km from the aircraft")
+
+    def _adopt_estimate(self, estimate, reason: str, coarse: bool = False):
+        self.set_receiver_location(estimate[0], estimate[1], source="adsb-estimate")
+        self.receiver_accuracy_km = 300.0 if coarse else 50.0
+        logger.info(
+            f"Receiver location estimated from aircraft at {estimate[0]:.3f}, {estimate[1]:.3f} "
+            f"(±{self.receiver_accuracy_km:.0f} km; {reason})"
+        )
+        if self.on_receiver_estimate:
+            try:
+                self.on_receiver_estimate(estimate[0], estimate[1])
+            except Exception as e:
+                logger.debug(f"receiver estimate callback failed: {e}")
+        # Re-derive distances for aircraft already placed
+        for ac in self.aircraft.values():
+            if ac.latitude is not None:
+                ac.distance_km = round(haversine_km(self.receiver_lat, self.receiver_lon, ac.latitude, ac.longitude), 1)
+                ac.bearing_deg = round(initial_bearing_deg(self.receiver_lat, self.receiver_lon, ac.latitude, ac.longitude))
+
+    def estimate_receiver_location(self, min_aircraft: int = 3):
+        """Median of aircraft positions decoded from frame pairs: a receiver estimate within ~50 km."""
+        if len(self._pair_positions) < min_aircraft:
+            return None
+        lats = sorted(p[0] for p in self._pair_positions.values())
+        lons = sorted(p[1] for p in self._pair_positions.values())
+        mid = len(lats) // 2
+        return lats[mid], lons[mid]
 
     def _update_position(self, aircraft: Aircraft, msg_hex: str, tc: int):
         """Decode an airborne or surface position from CPR-encoded frames.
@@ -106,17 +186,20 @@ class ADSBDecoder:
         frames["odd" if cpr_format else "even"] = (cpr_lat, cpr_lon, now)
 
         position = None
+        from_pair = False
         airborne = 9 <= tc <= 18 or 20 <= tc <= 22
+        reference_ok = self.receiver_lat is not None and self.receiver_trusted
         try:
             if airborne:
                 even, odd = frames.get("even"), frames.get("odd")
                 if even and odd and abs(even[2] - odd[2]) <= CPR_PAIR_MAX_AGE_S:
                     position = cpr.airborne_global(even[0], even[1], odd[0], odd[1],
                                                    even_is_newer=even[2] >= odd[2])
-                if position is None and self.receiver_lat is not None:
+                    from_pair = position is not None
+                if position is None and reference_ok:
                     position = cpr.airborne_local(cpr_lat, cpr_lon, cpr_format,
                                                   self.receiver_lat, self.receiver_lon)
-            elif 5 <= tc <= 8 and self.receiver_lat is not None:
+            elif 5 <= tc <= 8 and reference_ok:
                 position = cpr.surface_local(cpr_lat, cpr_lon, cpr_format,
                                              self.receiver_lat, self.receiver_lon)
         except Exception as e:
@@ -126,6 +209,9 @@ class ADSBDecoder:
         if not position:
             return
         lat, lon = position
+        if from_pair:
+            self._pair_positions[aircraft.icao] = (lat, lon)
+            self._check_receiver_against_aircraft()
         aircraft.latitude = lat
         aircraft.longitude = lon
         aircraft.position_time = datetime.now()
@@ -340,6 +426,9 @@ class ADSBDecoder:
             "receiver_location": (
                 [self.receiver_lat, self.receiver_lon] if self.receiver_lat is not None else None
             ),
+            "receiver_source": self.receiver_source,
+            "receiver_trusted": self.receiver_trusted,
+            "receiver_accuracy_km": self.receiver_accuracy_km,
             "climbing": sum(1 for ac in active if (ac.get("vertical_rate") or 0) > 200),
             "descending": sum(1 for ac in active if (ac.get("vertical_rate") or 0) < -200),
         }

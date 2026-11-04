@@ -96,6 +96,7 @@ class AISDecoder:
         self.decode_errors = 0
         self.recent_nmea: Deque[str] = deque(maxlen=200)
         self._pending: Dict[str, Dict[int, str]] = {}
+        self.engine: Optional[str] = None
 
     # ------------------------------------------------------------ ingest
 

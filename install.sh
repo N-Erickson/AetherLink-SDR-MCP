@@ -268,7 +268,7 @@ install_multimon_ng() {
         return
     fi
 
-    if ! prompt_yn "Install multimon-ng (POCSAG pager decoding)?"; then
+    if ! prompt_yn "Install multimon-ng (optional external POCSAG engine; the built-in decoder needs nothing)?"; then
         warn "Skipped multimon-ng"
         return
     fi
@@ -353,7 +353,7 @@ install_ais_receiver() {
         return
     fi
 
-    if ! prompt_yn "Install rtl_ais (AIS ship tracking)?"; then
+    if ! prompt_yn "Install rtl_ais (optional external AIS engine; the built-in receiver needs nothing)?"; then
         warn "Skipped AIS receiver"
         return
     fi
