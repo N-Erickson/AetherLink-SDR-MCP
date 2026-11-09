@@ -32,7 +32,7 @@ classifiers = [
 dependencies = [
     # The MCP Python SDK 2.x removed the low-level Server decorators this server
     # is built on (list_tools/call_tool/...). Stay on 1.x until the port lands.
-    "mcp>=1.23.0,<2",
+    "mcp>=1.23.0,<3",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
     # pyrtlsdr 0.4+ binds rtlsdr_set_dithering at import, which the stock Osmocom
