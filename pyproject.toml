@@ -38,7 +38,7 @@ dependencies = [
     # pyrtlsdr 0.4+ binds rtlsdr_set_dithering at import, which the stock Osmocom
     # librtlsdr (e.g. Homebrew 2.0.2) does not export, so RTL-SDR support would fail
     # to load on those systems. Stay on 0.3.x and shim its pkg_resources import.
-    "pyrtlsdr>=0.3.0,<0.4",
+    "pyrtlsdr>=0.3.0,<0.6",
     "sgp4>=2.22",        # satellite pass prediction
     "pyModeS>=2.19",     # ADS-B decoding
     "pyais>=2.5.0",      # AIS decoding
