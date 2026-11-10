@@ -9,6 +9,17 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+    ignore:
+      # MCP Python SDK 2.x removed the low-level Server decorators this server
+      # uses (list_tools/call_tool/...). Lift when the port to the 2.x API lands.
+      - dependency-name: "mcp"
+        versions: [">=2"]
+      # pyrtlsdr 0.4+ binds rtlsdr_set_dithering at import, which the stock
+      # Osmocom librtlsdr (Homebrew 2.0.2) does not export, so RTL-SDR support
+      # would fail to load on those systems. CI cannot see this: runners have
+      # no librtlsdr. Lift when pyrtlsdr guards the symbol.
+      - dependency-name: "pyrtlsdr"
+        versions: [">=0.4"]
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
